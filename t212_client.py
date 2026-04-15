@@ -1,5 +1,4 @@
 import base64
-import os
 import httpx
 
 
@@ -23,17 +22,67 @@ class T212Client:
         )
         self.mode = mode
 
+    # ── Portfolio & Account ──────────────────────────────────────────────────
+
     async def get_portfolio(self) -> list[dict]:
-        """GET /equity/portfolio — returns list of open positions."""
+        """GET /equity/portfolio — open positions."""
         resp = await self._client.get("/equity/portfolio")
         self._raise_for_status(resp)
         return resp.json()
 
     async def get_account_summary(self) -> dict:
-        """GET /equity/account/summary — returns account totals."""
+        """GET /equity/account/summary — account totals."""
         resp = await self._client.get("/equity/account/summary")
         self._raise_for_status(resp)
         return resp.json()
+
+    # ── History ──────────────────────────────────────────────────────────────
+
+    async def get_order_history(self, limit: int = 50) -> list[dict]:
+        """GET /equity/history/orders — recent order history."""
+        resp = await self._client.get("/equity/history/orders", params={"limit": limit})
+        self._raise_for_status(resp)
+        data = resp.json()
+        return data.get("items", data) if isinstance(data, dict) else data
+
+    async def get_dividend_history(self, limit: int = 20) -> list[dict]:
+        """GET /equity/history/dividends — dividend payments received."""
+        resp = await self._client.get("/equity/history/dividends", params={"limit": limit})
+        self._raise_for_status(resp)
+        data = resp.json()
+        return data.get("items", data) if isinstance(data, dict) else data
+
+    async def get_transaction_history(self, limit: int = 20) -> list[dict]:
+        """GET /equity/history/transactions — cash transactions (deposits, withdrawals)."""
+        resp = await self._client.get("/equity/history/transactions", params={"limit": limit})
+        self._raise_for_status(resp)
+        data = resp.json()
+        return data.get("items", data) if isinstance(data, dict) else data
+
+    # ── Orders ───────────────────────────────────────────────────────────────
+
+    async def get_open_orders(self) -> list[dict]:
+        """GET /equity/orders — currently open/pending orders."""
+        resp = await self._client.get("/equity/orders")
+        self._raise_for_status(resp)
+        data = resp.json()
+        return data.get("items", data) if isinstance(data, dict) else data
+
+    # ── Pies ─────────────────────────────────────────────────────────────────
+
+    async def get_pies(self) -> list[dict]:
+        """GET /equity/pies — all pies (automated portfolios)."""
+        resp = await self._client.get("/equity/pies")
+        self._raise_for_status(resp)
+        return resp.json()
+
+    async def get_pie(self, pie_id: int) -> dict:
+        """GET /equity/pies/{id} — detailed breakdown of a single pie."""
+        resp = await self._client.get(f"/equity/pies/{pie_id}")
+        self._raise_for_status(resp)
+        return resp.json()
+
+    # ── Metadata ─────────────────────────────────────────────────────────────
 
     async def find_instrument(self, query: str) -> dict | None:
         """Search instruments by shortName (ticker) or name. Returns first match."""
@@ -41,41 +90,15 @@ class T212Client:
         self._raise_for_status(resp)
         instruments = resp.json()
         q = query.upper()
-        # Exact shortName match first
         for inst in instruments:
             if inst.get("shortName", "").upper() == q:
                 return inst
-        # Fallback: name contains query
         for inst in instruments:
             if q in inst.get("name", "").upper():
                 return inst
         return None
 
-    async def get_order_history(self, limit: int = 50) -> list[dict]:
-        """GET /equity/history/orders — returns recent order history."""
-        resp = await self._client.get(
-            "/equity/history/orders",
-            params={"limit": limit},
-        )
-        self._raise_for_status(resp)
-        data = resp.json()
-        # Response is either a list or {"items": [...]}
-        return data.get("items", data) if isinstance(data, dict) else data
-
-    async def place_market_order(
-        self, t212_ticker: str, quantity: float | None = None, value: float | None = None
-    ) -> dict:
-        """POST /equity/orders/market — place a market order by quantity or GBP value."""
-        if quantity is None and value is None:
-            raise ValueError("Provide either quantity or value")
-        body = {"ticker": t212_ticker}
-        if quantity is not None:
-            body["quantity"] = quantity
-        else:
-            body["value"] = value
-        resp = await self._client.post("/equity/orders/market", json=body)
-        self._raise_for_status(resp)
-        return resp.json()
+    # ── Shared ───────────────────────────────────────────────────────────────
 
     async def aclose(self):
         await self._client.aclose()

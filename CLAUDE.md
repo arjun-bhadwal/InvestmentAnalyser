@@ -51,6 +51,18 @@ For each position or stock discussed:
 
 ---
 
+## Number Formatting
+
+The user writes decimal numbers using **European notation** — comma as decimal separator, period as thousands separator (or no thousands separator at all).
+
+- `1260,63` = **1,260.63** (not 1.26 million)
+- `22.405,47` = **22,405.47**
+- `0,47` = **0.47**
+
+Never interpret a comma in a number as a thousands separator when the user writes it. Always treat it as a decimal point.
+
+---
+
 ## Decision Framework
 
 - Every recommendation must state the **intended holding period** (trade vs. position vs. long-term)

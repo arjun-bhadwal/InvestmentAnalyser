@@ -149,24 +149,44 @@ async def get_trade_history(limit: int = 20) -> str:
         return "No trade history found."
 
     lines = [f"**Trade History — last {limit} orders ({T212_MODE.upper()})**\n",
-             f"{'Date':<14} {'Ticker':<10} {'Side':<6} {'Qty':>10} {'Price':>10} {'Value':>10}",
-             "-" * 64]
+             f"{'Date':<14} {'Name':<28} {'Side':<5} {'Qty':>10} {'Price':>10} {'Value':>10} {'CCY':<5}",
+             "-" * 86]
 
     for o in orders:
-        ticker = _strip_t212_ticker(o.get("ticker", "?"))
-        qty = o.get("filledQuantity") or o.get("quantity", 0)
-        price = o.get("filledPrice") or o.get("limitPrice") or 0
-        value = float(qty or 0) * float(price or 0)
-        order_type = o.get("type", "")
-        side = "BUY" if "BUY" in order_type.upper() else "SELL" if "SELL" in order_type.upper() else order_type[:4]
-        raw_date = o.get("dateCreated") or o.get("dateModified") or ""
+        # Live API wraps in {order: {...}, fill: {...}}; demo is flat
+        order = o.get("order", o)
+        fill  = o.get("fill", o)
+
+        raw_ticker = order.get("ticker", "?")
+        instrument = order.get("instrument", {}) or {}
+        name = instrument.get("name") or _strip_t212_ticker(raw_ticker)
+        name = name[:27]
+
+        side = order.get("side", "")
+        if not side:
+            otype = order.get("type", "")
+            side = "BUY" if "BUY" in otype.upper() else "SELL" if "SELL" in otype.upper() else otype[:4]
+
+        qty = float(fill.get("quantity") or order.get("filledQuantity") or order.get("quantity") or 0)
+
+        # Use walletImpact.netValue as the true GBP value — avoids GBX/GBP confusion
+        # where some LSE instruments return prices in pence but currency shows GBP
+        wallet = (fill.get("walletImpact") or {})
+        value  = abs(float(wallet.get("netValue") or order.get("filledValue") or order.get("value") or 0))
+        ccy    = wallet.get("currency") or order.get("currency", "")
+
+        # Back-calculate price in GBP from the true value
+        price = (value / qty) if qty else 0
+
+        raw_date = order.get("createdAt") or order.get("dateCreated") or fill.get("filledAt") or ""
         try:
-            date_str = datetime.fromisoformat(raw_date[:19]).strftime("%d %b %Y")
+            date_str = datetime.fromisoformat(raw_date[:19].replace("Z", "")).strftime("%d %b %Y")
         except Exception:
             date_str = raw_date[:10]
+
         lines.append(
-            f"{date_str:<14} {ticker:<10} {side:<6} {_fmt_float(qty, 4):>10} "
-            f"{_fmt_float(price):>10} {_fmt_float(value):>10}"
+            f"{date_str:<14} {name:<28} {side:<5} {_fmt_float(qty, 4):>10} "
+            f"{_fmt_float(price):>10} {_fmt_float(value):>10} {ccy:<5}"
         )
 
     return "\n".join(lines)
@@ -333,52 +353,59 @@ async def get_analyst_ratings(ticker: str) -> str:
     Use this to understand what professional analysts think."""
 
     def _fetch():
-        client = finnhub.Client(api_key=FINNHUB_API_KEY)
-        recs = client.recommendation_trends(ticker.upper())
-        target = client.price_target(ticker.upper())
-        return recs, target
+        t = yf.Ticker(ticker)
+        info = t.info
+        try:
+            recs = t.recommendations
+        except Exception:
+            recs = None
+        return info, recs
 
     try:
-        recs, target = await asyncio.to_thread(_fetch)
+        info, recs = await asyncio.to_thread(_fetch)
     except Exception as e:
         return f"Error fetching analyst data for {ticker}: {e}"
 
-    lines = [f"**Analyst Ratings — {ticker.upper()}**\n"]
+    name = info.get("longName") or ticker.upper()
+    currency = info.get("currency", "")
+    lines = [f"**Analyst Ratings — {name} ({ticker.upper()})**\n"]
 
-    # Price target
-    if target:
-        mean_t = target.get("targetMean")
-        high_t = target.get("targetHigh")
-        low_t = target.get("targetLow")
-        n_analysts = target.get("targetNumberOfAnalysts") or target.get("numberOfAnalysts", "?")
-        lines.append(f"**Price Targets ({n_analysts} analysts)**")
-        lines.append(f"- Mean target:  {_fmt_float(mean_t)}")
-        lines.append(f"- High target:  {_fmt_float(high_t)}")
-        lines.append(f"- Low target:   {_fmt_float(low_t)}")
+    # Price targets & consensus
+    n = info.get("numberOfAnalystOpinions", "?")
+    mean_t  = info.get("targetMeanPrice")
+    high_t  = info.get("targetHighPrice")
+    low_t   = info.get("targetLowPrice")
+    med_t   = info.get("targetMedianPrice")
+    rec_key = info.get("recommendationKey", "N/A").upper()
+    current = info.get("currentPrice") or info.get("regularMarketPrice")
+
+    lines.append(f"**Consensus: {rec_key}** ({n} analysts)")
+    lines.append("")
+    lines.append(f"**Price Targets ({currency})**")
+    lines.append(f"- Current price: {_fmt_float(current)}")
+    lines.append(f"- Mean target:   {_fmt_float(mean_t)}")
+    lines.append(f"- Median target: {_fmt_float(med_t)}")
+    lines.append(f"- High target:   {_fmt_float(high_t)}")
+    lines.append(f"- Low target:    {_fmt_float(low_t)}")
+
+    if mean_t and current:
+        upside = (float(mean_t) - float(current)) / float(current) * 100
+        sign = "+" if upside >= 0 else ""
+        lines.append(f"- Implied upside: {sign}{upside:.1f}%")
+
+    # Recent recommendation history from yfinance
+    if recs is not None and not recs.empty:
         lines.append("")
-
-    # Recommendation trends (most recent 3 periods)
-    if recs:
-        lines.append(f"**Recommendation Trends**")
-        lines.append(f"{'Period':<12} {'Strong Buy':>11} {'Buy':>6} {'Hold':>6} {'Sell':>6} {'Strong Sell':>12}")
-        lines.append("-" * 57)
-        for r in recs[:3]:
-            period = r.get("period", "")[:7]
-            lines.append(
-                f"{period:<12} {r.get('strongBuy', 0):>11} {r.get('buy', 0):>6} "
-                f"{r.get('hold', 0):>6} {r.get('sell', 0):>6} {r.get('strongSell', 0):>12}"
-            )
-
-        # Summarise latest
-        if recs:
-            latest = recs[0]
-            total = sum(latest.get(k, 0) for k in ["strongBuy", "buy", "hold", "sell", "strongSell"])
-            bullish = latest.get("strongBuy", 0) + latest.get("buy", 0)
-            bearish = latest.get("sell", 0) + latest.get("strongSell", 0)
-            if total:
-                lines.append(f"\nLatest consensus: {bullish/total*100:.0f}% bullish, "
-                             f"{latest.get('hold',0)/total*100:.0f}% hold, "
-                             f"{bearish/total*100:.0f}% bearish ({total} analysts)")
+        lines.append("**Recent Analyst Recommendations**")
+        lines.append(f"{'Date':<14} {'Firm':<28} {'To Grade':<20} {'Action'}")
+        lines.append("-" * 74)
+        recent = recs.tail(8).iloc[::-1]
+        for date, row in recent.iterrows():
+            date_str = date.strftime("%d %b %Y") if hasattr(date, "strftime") else str(date)[:10]
+            firm  = str(row.get("Firm", ""))[:27]
+            grade = str(row.get("To Grade", row.get("toGrade", "")))[:19]
+            action = str(row.get("Action", row.get("action", "")))
+            lines.append(f"{date_str:<14} {firm:<28} {grade:<20} {action}")
 
     return "\n".join(lines)
 
@@ -498,62 +525,162 @@ async def get_market_snapshot() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Order Tools
+# History — Dividends & Transactions
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def place_order(ticker: str, side: str, quantity: float | None = None, value: float | None = None) -> str:
-    """Place a market buy or sell order on your Trading 212 account.
-    - ticker: stock symbol, e.g. AAPL, TSLA, LLOY
-    - side: 'buy' or 'sell'
-    - quantity: number of shares (fractional ok), OR
-    - value: amount in account currency (e.g. 100 = £100 worth)
-    Only provide one of quantity or value.
-    """
-    side = side.lower()
-    if side not in ("buy", "sell"):
-        return "Error: side must be 'buy' or 'sell'."
-    if quantity is None and value is None:
-        return "Error: provide either quantity or value."
-    if quantity is not None and value is not None:
-        return "Error: provide either quantity or value, not both."
-
+async def get_dividend_history(limit: int = 20) -> str:
+    """Return dividend payments received in your Trading 212 account.
+    Use this to track income from dividend-paying stocks."""
     try:
-        instrument = await t212.find_instrument(ticker)
+        dividends = await t212.get_dividend_history(limit=limit)
     except Exception as e:
-        return f"Error looking up instrument '{ticker}': {e}"
+        return f"Error fetching dividend history: {e}"
 
-    if instrument is None:
-        return f"Instrument '{ticker}' not found on Trading 212."
+    if not dividends:
+        return f"No dividend history found in your T212 {T212_MODE} account."
 
-    t212_ticker = instrument["ticker"]
-    name = instrument.get("name", ticker)
+    lines = [
+        f"**Dividend History ({T212_MODE.upper()}) — last {limit}**\n",
+        f"{'Date':<14} {'Ticker':<10} {'Shares':>10} {'Amount':>12} {'Tax':>10}",
+        "-" * 60,
+    ]
+    total = 0.0
+    for d in dividends:
+        ticker = _strip_t212_ticker(d.get("ticker", "?"))
+        raw_date = d.get("paidOn") or d.get("date") or ""
+        try:
+            date_str = datetime.fromisoformat(raw_date[:10]).strftime("%d %b %Y")
+        except Exception:
+            date_str = raw_date[:10]
+        amount = float(d.get("amount", 0) or 0)
+        tax = float(d.get("grossAmountPerShare", 0) or 0)
+        quantity = float(d.get("quantity", 0) or 0)
+        total += amount
+        lines.append(
+            f"{date_str:<14} {ticker:<10} {_fmt_float(quantity, 4):>10} "
+            f"{_fmt_float(amount):>12} {_fmt_float(tax):>10}"
+        )
 
-    if side == "sell":
-        if quantity is not None:
-            quantity = -abs(quantity)
-        elif value is not None:
-            value = -abs(value)
+    lines.append("-" * 60)
+    lines.append(f"{'Total dividends received':<46} {_fmt_float(total):>12}")
+    return "\n".join(lines)
 
+
+@mcp.tool()
+async def get_transaction_history(limit: int = 20) -> str:
+    """Return cash transaction history: deposits and withdrawals on your Trading 212 account."""
     try:
-        order = await t212.place_market_order(t212_ticker, quantity=quantity, value=value)
+        transactions = await t212.get_transaction_history(limit=limit)
     except Exception as e:
-        return f"Error placing order: {e}"
+        return f"Error fetching transaction history: {e}"
 
-    order_id = order.get("id", "?")
-    status = order.get("status", "?")
-    filled_qty = order.get("filledQuantity") or order.get("quantity", "?")
-    filled_val = order.get("filledValue") or order.get("value", "?")
+    if not transactions:
+        return f"No transaction history found in your T212 {T212_MODE} account."
 
-    return (
-        f"**Order placed — {side.upper()} {name} ({ticker})**\n\n"
-        f"- T212 ticker: {t212_ticker}\n"
-        f"- Order ID:    {order_id}\n"
-        f"- Status:      {status}\n"
-        f"- Quantity:    {filled_qty}\n"
-        f"- Value:       {filled_val}\n"
-        f"- Account:     {T212_MODE.upper()}"
-    )
+    lines = [
+        f"**Transaction History ({T212_MODE.upper()}) — last {limit}**\n",
+        f"{'Date':<14} {'Type':<16} {'Amount':>14} {'Currency':<10}",
+        "-" * 58,
+    ]
+    for t in transactions:
+        raw_date = t.get("dateTime") or t.get("date") or ""
+        try:
+            date_str = datetime.fromisoformat(raw_date[:10]).strftime("%d %b %Y")
+        except Exception:
+            date_str = raw_date[:10]
+        tx_type = t.get("type", "UNKNOWN")
+        amount = float(t.get("amount", 0) or 0)
+        currency = t.get("currency", "")
+        sign = "+" if amount >= 0 else ""
+        lines.append(f"{date_str:<14} {tx_type:<16} {sign}{_fmt_float(amount):>14} {currency:<10}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Orders — Open / Pending
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_open_orders() -> str:
+    """Return any currently open or pending orders on your Trading 212 account.
+    Use this to check what limit or pending orders are waiting to be filled."""
+    try:
+        orders = await t212.get_open_orders()
+    except Exception as e:
+        return f"Error fetching open orders: {e}"
+
+    if not orders:
+        return f"No open or pending orders in your T212 {T212_MODE} account."
+
+    lines = [
+        f"**Open Orders ({T212_MODE.upper()})**\n",
+        f"{'Ticker':<10} {'Type':<12} {'Side':<6} {'Qty':>10} {'Limit':>10} {'Value':>10} {'Status':<12}",
+        "-" * 74,
+    ]
+    for o in orders:
+        ticker = _strip_t212_ticker(o.get("ticker", "?"))
+        order_type = o.get("type", "")
+        side = "BUY" if "BUY" in order_type.upper() else "SELL" if "SELL" in order_type.upper() else "?"
+        qty = o.get("quantity", 0)
+        limit = o.get("limitPrice") or o.get("stopPrice") or 0
+        value = o.get("value", 0) or (float(qty or 0) * float(limit or 0))
+        status = o.get("status", "?")
+        lines.append(
+            f"{ticker:<10} {order_type:<12} {side:<6} {_fmt_float(qty, 4):>10} "
+            f"{_fmt_float(limit):>10} {_fmt_float(value):>10} {status:<12}"
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Pies
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_pies() -> str:
+    """Return all Pies (automated portfolios) in your Trading 212 account with their value and performance.
+    Use this to see how your pie investments are performing."""
+    try:
+        pies = await t212.get_pies()
+    except Exception as e:
+        return f"Error fetching pies: {e}"
+
+    if not pies:
+        return f"No pies found in your T212 {T212_MODE} account."
+
+    # Fetch names for each pie in parallel
+    async def _get_name(pie_id: int) -> str:
+        try:
+            detail = await t212.get_pie(pie_id)
+            return (detail.get("settings", {}) or {}).get("name", "") or f"Pie {pie_id}"
+        except Exception:
+            return f"Pie {pie_id}"
+
+    names = await asyncio.gather(*[_get_name(p["id"]) for p in pies])
+
+    lines = [
+        f"**Pies ({T212_MODE.upper()})**\n",
+        f"{'ID':<10} {'Name':<28} {'Invested':>12} {'Value':>12} {'Return':>10} {'Return%':>8}",
+        "-" * 84,
+    ]
+    for pie, name in zip(pies, names):
+        pie_id = str(pie.get("id", "?"))
+        result = pie.get("result", {}) or {}
+        invested = float(result.get("priceAvgInvestedValue", 0) or 0)
+        value    = float(result.get("priceAvgValue", 0) or 0)
+        ret      = float(result.get("priceAvgResult", 0) or 0)
+        ret_coef = float(result.get("priceAvgResultCoef", 0) or 0)
+        ret_pct  = ret_coef * 100
+        sign = "+" if ret >= 0 else ""
+        lines.append(
+            f"{pie_id:<10} {name[:27]:<28} {_fmt_float(invested):>12} {_fmt_float(value):>12} "
+            f"{sign}{_fmt_float(ret):>10} {sign}{ret_pct:.2f}%"
+        )
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
