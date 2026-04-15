@@ -8,7 +8,7 @@ import yfinance as yf
 from scipy.stats import norm
 
 import app
-from helpers import strip_t212_ticker, fmt_float
+from helpers import strip_t212_ticker, fmt_float, position_value
 
 mcp = app.mcp
 
@@ -81,7 +81,7 @@ async def get_portfolio_risk() -> str:
 
         lines.append(f"{t:<10} {ann_ret:>+10.2f} {ann_vol:>10.2f} {sharpe:>8.2f} {max_dd:>+8.2f} {beta:>7.2f}")
 
-    weights_raw = {strip_t212_ticker(p["ticker"]): float(p.get("currentPrice", 1) or 1) * float(p.get("quantity", 0) or 0) for p in positions}
+    weights_raw = {strip_t212_ticker(p["ticker"]): position_value(p) for p in positions}
     total_val = sum(weights_raw.values()) or 1
     weights = {k: v / total_val for k, v in weights_raw.items()}
 
@@ -214,7 +214,7 @@ async def get_portfolio_stress_test(simulations: int = 1000) -> str:
         return "No open positions."
 
     tickers = [strip_t212_ticker(p["ticker"]) for p in positions]
-    weights_raw = {strip_t212_ticker(p["ticker"]): float(p.get("currentPrice", 1) or 1) * float(p.get("quantity", 0) or 0) for p in positions}
+    weights_raw = {strip_t212_ticker(p["ticker"]): position_value(p) for p in positions}
     total = sum(weights_raw.values()) or 1
     weights = {k: v / total for k, v in weights_raw.items()}
 
@@ -295,7 +295,7 @@ async def get_portfolio_allocation() -> str:
     holdings = []
     for p in positions:
         ticker = strip_t212_ticker(p["ticker"])
-        holdings.append({"ticker": ticker, "value": float(p.get("quantity", 0) or 0) * float(p.get("currentPrice", 0) or 0)})
+        holdings.append({"ticker": ticker, "value": position_value(p)})
 
     total_val = sum(h["value"] for h in holdings) or 1
 

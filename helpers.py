@@ -46,6 +46,17 @@ def fmt_float(value, decimals: int = 2) -> str:
         return "N/A"
 
 
+def position_value(pos: dict) -> float:
+    """Calculate position value, converting GBX (pence) → GBP when needed."""
+    qty = float(pos.get("quantity", 0) or 0)
+    price = float(pos.get("currentPrice", 0) or 0)
+    ccy = (pos.get("currencyCode") or pos.get("currency") or "").upper()
+    if ccy in ("GBX", "GBP"):  # GBX = pence, divide by 100
+        if ccy == "GBX":
+            price = price / 100
+    return qty * price
+
+
 def fmt_billions(val) -> str:
     """Format large numbers as billions/millions."""
     import numpy as np
