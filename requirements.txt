@@ -5,3 +5,6 @@ yfinance>=0.2.40
 finnhub-python>=2.4.20
 python-dotenv>=1.0.0
 duckduckgo-search>=6.0.0
+ta>=0.11.0
+numpy>=1.26.0
+scipy>=1.13.0

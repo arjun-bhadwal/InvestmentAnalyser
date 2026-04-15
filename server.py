@@ -4,10 +4,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
 import finnhub
+import numpy as np
+import pandas as pd
+import ta as ta_lib
 import yfinance as yf
 from duckduckgo_search import DDGS
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from scipy.stats import norm
 
 from t212_client import T212Client
 
@@ -679,6 +683,779 @@ async def get_pies() -> str:
             f"{pie_id:<10} {name[:27]:<28} {_fmt_float(invested):>12} {_fmt_float(value):>12} "
             f"{sign}{_fmt_float(ret):>10} {sign}{ret_pct:.2f}%"
         )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Technical Analysis
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_technical_indicators(ticker: str) -> str:
+    """Return key technical indicators for a stock: RSI, MACD, Bollinger Bands, moving averages,
+    ATR, and a plain-English signal summary. Use this for entry/exit timing and trend confirmation."""
+
+    def _fetch():
+        df = yf.Ticker(ticker).history(period="6mo", interval="1d", auto_adjust=True)
+        if df.empty:
+            return None
+        df.columns = [c.lower() for c in df.columns]
+
+        close = df["close"]
+        high  = df["high"]
+        low   = df["low"]
+
+        # Moving averages
+        df["ma20"]  = ta_lib.trend.sma_indicator(close, window=20)
+        df["ma50"]  = ta_lib.trend.sma_indicator(close, window=50)
+        df["ma200"] = ta_lib.trend.sma_indicator(close, window=200)
+
+        # RSI
+        df["rsi"] = ta_lib.momentum.RSIIndicator(close, window=14).rsi()
+
+        # MACD
+        macd_obj = ta_lib.trend.MACD(close, window_fast=12, window_slow=26, window_sign=9)
+        df["macd"]      = macd_obj.macd()
+        df["macd_sig"]  = macd_obj.macd_signal()
+        df["macd_hist"] = macd_obj.macd_diff()
+
+        # Bollinger Bands
+        bb_obj = ta_lib.volatility.BollingerBands(close, window=20, window_dev=2)
+        df["bb_upper"] = bb_obj.bollinger_hband()
+        df["bb_mid"]   = bb_obj.bollinger_mavg()
+        df["bb_lower"] = bb_obj.bollinger_lband()
+
+        # ATR
+        df["atr"] = ta_lib.volatility.AverageTrueRange(high, low, close, window=14).average_true_range()
+
+        return df
+
+    try:
+        df = await asyncio.to_thread(_fetch)
+    except Exception as e:
+        return f"Error computing indicators for {ticker}: {e}"
+
+    if df is None or df.empty:
+        return f"No data found for '{ticker}'."
+
+    row = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else row
+    price = row["close"]
+
+    def _g(col):
+        v = row.get(col)
+        return float(v) if v is not None and not np.isnan(float(v) if v is not None else float("nan")) else None
+
+    rsi    = _g("rsi")
+    ma20   = _g("ma20")
+    ma50   = _g("ma50")
+    ma200  = _g("ma200")
+    atr    = _g("atr")
+
+    macd_val  = _g("macd")
+    macd_sig  = _g("macd_sig")
+    macd_hist = _g("macd_hist")
+
+    bb_upper = _g("bb_upper")
+    bb_mid   = _g("bb_mid")
+    bb_lower = _g("bb_lower")
+
+    def _fmt(v, d=2):
+        return f"{v:,.{d}f}" if v is not None else "N/A"
+
+    # --- Signal interpretation ---
+    signals = []
+
+    if rsi is not None:
+        if rsi < 30:
+            signals.append("RSI OVERSOLD — potential reversal / buy zone")
+        elif rsi > 70:
+            signals.append("RSI OVERBOUGHT — caution, potential pullback")
+        else:
+            signals.append(f"RSI neutral ({rsi:.1f})")
+
+    if ma20 and ma50:
+        if ma20 > ma50:
+            signals.append("MA20 > MA50 — short-term uptrend")
+        else:
+            signals.append("MA20 < MA50 — short-term downtrend")
+
+    if ma50 and ma200:
+        if ma50 > ma200:
+            signals.append("Golden Cross: MA50 > MA200 — bullish long-term")
+        else:
+            signals.append("Death Cross: MA50 < MA200 — bearish long-term")
+
+    if macd_val is not None and macd_sig is not None:
+        prev_hist = float(prev.get("macd_hist") or 0)
+        if macd_hist is not None:
+            if macd_hist > 0 and prev_hist <= 0:
+                signals.append("MACD bullish crossover — momentum turning positive")
+            elif macd_hist < 0 and prev_hist >= 0:
+                signals.append("MACD bearish crossover — momentum turning negative")
+            elif macd_hist > 0:
+                signals.append("MACD positive — bullish momentum")
+            else:
+                signals.append("MACD negative — bearish momentum")
+
+    if bb_upper and bb_lower and bb_mid:
+        bb_pct = (price - bb_lower) / (bb_upper - bb_lower) * 100 if (bb_upper - bb_lower) > 0 else 50
+        if bb_pct > 90:
+            signals.append(f"Price near upper Bollinger Band ({bb_pct:.0f}%) — extended, watch for rejection")
+        elif bb_pct < 10:
+            signals.append(f"Price near lower Bollinger Band ({bb_pct:.0f}%) — oversold zone")
+        else:
+            signals.append(f"Price within Bollinger Bands ({bb_pct:.0f}% of range)")
+
+    lines = [
+        f"**{ticker.upper()} — Technical Indicators**\n",
+        f"- Price:         {_fmt(price)}",
+        "",
+        f"**Moving Averages**",
+        f"- MA20:          {_fmt(ma20)}   {'▲ above' if ma20 and price > ma20 else '▼ below' if ma20 else ''}",
+        f"- MA50:          {_fmt(ma50)}   {'▲ above' if ma50 and price > ma50 else '▼ below' if ma50 else ''}",
+        f"- MA200:         {_fmt(ma200)}   {'▲ above' if ma200 and price > ma200 else '▼ below' if ma200 else ''}",
+        "",
+        f"**Momentum**",
+        f"- RSI (14):      {_fmt(rsi, 1)}",
+        f"- MACD:          {_fmt(macd_val)}  Signal: {_fmt(macd_sig)}  Hist: {_fmt(macd_hist)}",
+        "",
+        f"**Volatility**",
+        f"- ATR (14):      {_fmt(atr)}  ({_fmt(atr/price*100, 1) if atr and price else 'N/A'}% of price)",
+        f"- BB Upper:      {_fmt(bb_upper)}",
+        f"- BB Mid:        {_fmt(bb_mid)}",
+        f"- BB Lower:      {_fmt(bb_lower)}",
+        "",
+        f"**Signal Summary**",
+    ]
+    for s in signals:
+        lines.append(f"  • {s}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Portfolio Risk Analytics
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_portfolio_risk() -> str:
+    """Compute portfolio-level risk metrics: Sharpe ratio, Sortino ratio, max drawdown,
+    annualised return/volatility, and pairwise correlation between positions.
+    Use this for portfolio health checks and position sizing decisions."""
+
+    # Step 1: get current positions from T212
+    try:
+        positions = await t212.get_portfolio()
+    except Exception as e:
+        return f"Error fetching portfolio: {e}"
+
+    if not positions:
+        return "No open positions to analyse."
+
+    tickers = [_strip_t212_ticker(p["ticker"]) for p in positions]
+
+    # Step 2: fetch 1-year daily closes for all tickers
+    def _fetch_history(syms):
+        raw = yf.download(syms, period="1y", interval="1d", auto_adjust=True, progress=False)
+        if isinstance(raw.columns, pd.MultiIndex):
+            return raw["Close"]
+        return raw[["Close"]].rename(columns={"Close": syms[0]}) if len(syms) == 1 else raw
+
+    try:
+        closes = await asyncio.to_thread(_fetch_history, tickers)
+    except Exception as e:
+        return f"Error fetching price history: {e}"
+
+    closes = closes.dropna(how="all")
+    if closes.empty:
+        return "Could not retrieve sufficient price history for portfolio risk analysis."
+
+    returns = closes.pct_change().dropna()
+
+    TRADING_DAYS = 252
+    RISK_FREE     = 0.045  # ~4.5% annualised (approx UK/US rate)
+
+    lines = ["**Portfolio Risk Analytics — 1-Year Lookback**\n"]
+
+    # --- Per-position stats ---
+    lines.append(f"{'Ticker':<10} {'Ann.Ret%':>10} {'Ann.Vol%':>10} {'Sharpe':>8} {'MaxDD%':>8} {'Beta':>7}")
+    lines.append("-" * 56)
+
+    sharpes = []
+    for col in returns.columns:
+        r = returns[col].dropna()
+        if len(r) < 20:
+            lines.append(f"{col:<10} {'insufficient data':>44}")
+            continue
+
+        ann_ret  = float(r.mean() * TRADING_DAYS)
+        ann_vol  = float(r.std() * np.sqrt(TRADING_DAYS))
+        sharpe   = (ann_ret - RISK_FREE) / ann_vol if ann_vol > 0 else 0
+
+        # Max drawdown
+        cum = (1 + r).cumprod()
+        rolling_max = cum.cummax()
+        drawdown = (cum - rolling_max) / rolling_max
+        max_dd   = float(drawdown.min())
+
+        # Beta vs S&P 500
+        try:
+            spy = yf.Ticker("^GSPC").history(period="1y", interval="1d", auto_adjust=True)["Close"].pct_change().dropna()
+            aligned = pd.concat([r, spy], axis=1).dropna()
+            if len(aligned) > 20:
+                cov = aligned.cov().iloc[0, 1]
+                var = aligned.iloc[:, 1].var()
+                beta = cov / var if var > 0 else 1.0
+            else:
+                beta = float("nan")
+        except Exception:
+            beta = float("nan")
+
+        sharpes.append(sharpe)
+        beta_str = f"{beta:.2f}" if not np.isnan(beta) else "N/A"
+        lines.append(
+            f"{col:<10} {ann_ret*100:>+9.1f}% {ann_vol*100:>9.1f}% "
+            f"{sharpe:>8.2f} {max_dd*100:>7.1f}% {beta_str:>7}"
+        )
+
+    # --- Portfolio-level stats (equal-weight approximation) ---
+    port_returns = returns[list(returns.columns)].mean(axis=1)
+    p_ann_ret  = float(port_returns.mean() * TRADING_DAYS)
+    p_ann_vol  = float(port_returns.std() * np.sqrt(TRADING_DAYS))
+    p_sharpe   = (p_ann_ret - RISK_FREE) / p_ann_vol if p_ann_vol > 0 else 0
+
+    p_cum = (1 + port_returns).cumprod()
+    p_max_dd = float(((p_cum - p_cum.cummax()) / p_cum.cummax()).min())
+
+    # Sortino (downside deviation)
+    downside = port_returns[port_returns < 0]
+    sortino_denom = float(downside.std() * np.sqrt(TRADING_DAYS)) if len(downside) > 0 else 0
+    sortino = (p_ann_ret - RISK_FREE) / sortino_denom if sortino_denom > 0 else 0
+
+    # Value at Risk (95% 1-day)
+    var_95 = float(norm.ppf(0.05, port_returns.mean(), port_returns.std()))
+
+    lines.append("-" * 56)
+    lines.append(f"\n**Portfolio Summary (equal-weight)**")
+    lines.append(f"- Annualised return:   {p_ann_ret*100:+.1f}%")
+    lines.append(f"- Annualised vol:      {p_ann_vol*100:.1f}%")
+    lines.append(f"- Sharpe ratio:        {p_sharpe:.2f}  (>1 = good, >2 = strong)")
+    lines.append(f"- Sortino ratio:       {sortino:.2f}  (penalises downside only)")
+    lines.append(f"- Max drawdown:        {p_max_dd*100:.1f}%")
+    lines.append(f"- 1-day 95% VaR:       {var_95*100:.2f}%  (expected worst-day loss 1-in-20)")
+
+    # --- Correlation matrix ---
+    if len(returns.columns) > 1:
+        corr = returns.corr().round(2)
+        lines.append(f"\n**Correlation Matrix (1Y daily returns)**")
+        header = f"{'':>10}" + "".join(f"{c:>8}" for c in corr.columns)
+        lines.append(header)
+        for row_name in corr.index:
+            row_vals = "".join(f"{corr.loc[row_name, c]:>8.2f}" for c in corr.columns)
+            lines.append(f"{row_name:>10}{row_vals}")
+        lines.append("\n  (Values near 1.0 = highly correlated = less diversification benefit)")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Earnings Calendar
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_earnings_calendar() -> str:
+    """Return upcoming earnings dates and recent EPS results for all stocks in your portfolio.
+    Use this to manage event risk — avoid being caught offside by surprise earnings moves."""
+
+    try:
+        positions = await t212.get_portfolio()
+    except Exception as e:
+        return f"Error fetching portfolio: {e}"
+
+    if not positions:
+        return "No open positions found."
+
+    tickers = [_strip_t212_ticker(p["ticker"]) for p in positions]
+
+    def _fetch_earnings(ticker):
+        t = yf.Ticker(ticker)
+        info = t.info
+        try:
+            cal = t.calendar
+        except Exception:
+            cal = None
+        try:
+            history = t.earnings_history
+        except Exception:
+            history = None
+        return info, cal, history
+
+    lines = ["**Earnings Calendar — Current Portfolio**\n"]
+
+    upcoming = []   # (date, ticker, eps_est)
+    results  = []   # (ticker, recent rows)
+
+    for ticker in tickers:
+        try:
+            info, cal, hist = await asyncio.to_thread(_fetch_earnings, ticker)
+        except Exception:
+            continue
+
+        name = (info.get("longName") or ticker)[:28]
+
+        # Next earnings date
+        next_date = None
+        if cal is not None:
+            if isinstance(cal, dict):
+                next_date = cal.get("Earnings Date") or cal.get("earningsDate")
+                if isinstance(next_date, list) and next_date:
+                    next_date = next_date[0]
+            elif isinstance(cal, pd.DataFrame) and not cal.empty:
+                try:
+                    nd = cal.loc["Earnings Date"]
+                    next_date = nd.iloc[0] if hasattr(nd, "iloc") else nd
+                except Exception:
+                    pass
+
+        eps_est = info.get("epsForward") or info.get("forwardEps")
+
+        if next_date:
+            try:
+                dt = pd.Timestamp(next_date).date()
+                days_away = (dt - datetime.today().date()).days
+                upcoming.append((dt, days_away, ticker, name, eps_est))
+            except Exception:
+                pass
+
+        # Recent earnings history (last 4 quarters)
+        if hist is not None and not hist.empty:
+            results.append((ticker, name, hist.tail(4)))
+
+    # --- Upcoming earnings ---
+    if upcoming:
+        upcoming.sort(key=lambda x: x[0])
+        lines.append("**Upcoming Earnings**")
+        lines.append(f"{'Date':<14} {'Ticker':<8} {'Company':<30} {'Days':<7} {'EPS Est':>8}")
+        lines.append("-" * 72)
+        for dt, days_away, ticker, name, eps_est in upcoming:
+            urgency = "⚠️ " if 0 <= days_away <= 14 else ""
+            eps_str = f"{float(eps_est):+.2f}" if eps_est else "N/A"
+            lines.append(
+                f"{urgency}{str(dt):<14} {ticker:<8} {name:<30} "
+                f"{days_away:>5}d   {eps_str:>8}"
+            )
+    else:
+        lines.append("No upcoming earnings dates found for current positions.")
+
+    # --- Recent results ---
+    if results:
+        lines.append("\n**Recent EPS Results (last 4 quarters)**")
+        for ticker, name, hist in results:
+            lines.append(f"\n  {ticker} — {name}")
+            lines.append(f"  {'Quarter':<12} {'EPS Est':>10} {'EPS Actual':>12} {'Surprise':>10}")
+            lines.append(f"  {'-'*48}")
+            for date, row in hist.iterrows():
+                date_str = str(date)[:10] if date else ""
+                est    = row.get("epsEstimate")
+                actual = row.get("epsActual")
+                surp   = row.get("epsSurprise") or row.get("surprisePercent")
+                est_s    = f"{float(est):+.3f}"    if est    is not None else "N/A"
+                actual_s = f"{float(actual):+.3f}" if actual is not None else "N/A"
+                surp_s   = f"{float(surp):+.2f}%"  if surp   is not None else "N/A"
+                lines.append(f"  {date_str:<12} {est_s:>10} {actual_s:>12} {surp_s:>10}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Sector Rotation Tracker
+# ---------------------------------------------------------------------------
+
+SECTOR_ETFS = {
+    "Technology":        "XLK",
+    "Energy":            "XLE",
+    "Financials":        "XLF",
+    "Health Care":       "XLV",
+    "Industrials":       "XLI",
+    "Materials":         "XLB",
+    "Real Estate":       "XLRE",
+    "Utilities":         "XLU",
+    "Consumer Staples":  "XLP",
+    "Consumer Discret.": "XLY",
+    "Communication":     "XLC",
+}
+
+
+@mcp.tool()
+async def get_sector_rotation() -> str:
+    """Return performance and momentum for all 11 S&P 500 sectors (SPDR ETFs) vs the S&P 500.
+    Shows 1-day, 1-week, 1-month, 3-month, and 1-year returns plus relative strength vs SPY.
+    Use this to identify where institutional money is flowing and which sectors to favour or avoid."""
+
+    symbols = list(SECTOR_ETFS.values()) + ["SPY"]
+
+    def _fetch():
+        return yf.download(symbols, period="1y", interval="1d", auto_adjust=True, progress=False)
+
+    try:
+        data = await asyncio.to_thread(_fetch)
+    except Exception as e:
+        return f"Error fetching sector data: {e}"
+
+    closes = data["Close"].dropna(how="all")
+    if closes.empty:
+        return "Could not retrieve sector data."
+
+    def _ret(sym, days):
+        col = closes[sym].dropna()
+        if len(col) < days + 1:
+            return None
+        start = float(col.iloc[-(days + 1)])
+        end   = float(col.iloc[-1])
+        return (end - start) / start * 100 if start else None
+
+    # Approximate trading days
+    periods = {"1D": 1, "1W": 5, "1M": 21, "3M": 63, "1Y": 252}
+
+    spy_rets = {label: _ret("SPY", days) for label, days in periods.items()}
+
+    rows = []
+    for name, sym in SECTOR_ETFS.items():
+        rets = {label: _ret(sym, days) for label, days in periods.items()}
+        # Relative strength vs SPY (1M momentum diff)
+        rs_1m = (rets["1M"] - spy_rets["1M"]) if rets["1M"] is not None and spy_rets["1M"] is not None else None
+        rows.append((name, sym, rets, rs_1m))
+
+    # Sort by 1-month return descending (momentum ranking)
+    rows.sort(key=lambda x: x[2]["1M"] if x[2]["1M"] is not None else -999, reverse=True)
+
+    def _fs(v):
+        if v is None:
+            return "  N/A "
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v:.1f}%"
+
+    lines = [
+        f"**Sector Rotation — {datetime.today().strftime('%d %b %Y')}**\n",
+        f"{'Sector':<22} {'ETF':<6} {'1D':>7} {'1W':>7} {'1M':>7} {'3M':>7} {'1Y':>7} {'vs SPY 1M':>10}",
+        "-" * 76,
+    ]
+
+    for name, sym, rets, rs_1m in rows:
+        rs_str = _fs(rs_1m)
+        trend = "▲" if rs_1m and rs_1m > 0 else "▼" if rs_1m and rs_1m < 0 else " "
+        lines.append(
+            f"{name:<22} {sym:<6} {_fs(rets['1D']):>7} {_fs(rets['1W']):>7} "
+            f"{_fs(rets['1M']):>7} {_fs(rets['3M']):>7} {_fs(rets['1Y']):>7} "
+            f"{trend}{rs_str:>9}"
+        )
+
+    # S&P 500 benchmark row
+    lines.append("-" * 76)
+    lines.append(
+        f"{'S&P 500 (SPY)':<22} {'SPY':<6} {_fs(spy_rets['1D']):>7} {_fs(spy_rets['1W']):>7} "
+        f"{_fs(spy_rets['1M']):>7} {_fs(spy_rets['3M']):>7} {_fs(spy_rets['1Y']):>7} {'benchmark':>10}"
+    )
+
+    # Flow interpretation
+    leaders  = [r[0] for r in rows[:3] if r[3] and r[3] > 0]
+    laggards = [r[0] for r in rows[-3:] if r[3] and r[3] < 0]
+    lines.append("")
+    if leaders:
+        lines.append(f"**Inflow leaders (outperforming SPY):** {', '.join(leaders)}")
+    if laggards:
+        lines.append(f"**Outflow / underperforming:**           {', '.join(laggards)}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Stock Screener
+# ---------------------------------------------------------------------------
+
+# Curated liquid universe — top S&P 500 names + FTSE 100 blue chips
+_SP500_TICKERS = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","BRK-B","TSLA","AVGO","JPM",
+    "LLY","V","UNH","XOM","MA","JNJ","PG","COST","HD","MRK","ABBV","CVX",
+    "KO","PEP","ADBE","WMT","BAC","CRM","ACN","MCD","TMO","CSCO","ABT","LIN",
+    "NFLX","AMD","TXN","DHR","NKE","PM","NEE","INTC","ORCL","UPS","QCOM",
+    "HON","LOW","UNP","RTX","AMGN","CAT","GS","SPGI","IBM","DE","AXP","BLK",
+    "ISRG","NOW","INTU","SYK","GILD","LMT","PLD","ADI","REGN","MDLZ","CI",
+    "MMC","ZTS","MO","DUK","SO","TGT","ETN","ITW","PGR","AON","CME","CL",
+    "APD","SHW","EW","WM","NSC","GD","F","GM","PYPL","SBUX","PANW","SNOW",
+    "CRWD","UBER","ABNB","COIN","PLTR","ARM",
+]
+
+_FTSE100_TICKERS = [
+    "SHEL.L","AZN.L","HSBA.L","BP.L","ULVR.L","RIO.L","GSK.L","REL.L",
+    "DGE.L","NG.L","LLOY.L","BARC.L","BT-A.L","VOD.L","STAN.L","RR.L",
+    "EXPN.L","LSEG.L","CPG.L","IMB.L","MKS.L","TSCO.L","BATS.L","AAL.L",
+    "ANTO.L","CCH.L","CNA.L","ENT.L","FRES.L","HLN.L","JMAT.L","KGF.L",
+    "MNDI.L","NWG.L","PHNX.L","PRU.L","SGE.L","SMDS.L","SSE.L","WPP.L",
+]
+
+_WATCHLIST: list[str] = []  # populated at runtime from T212 positions
+
+
+@mcp.tool()
+async def screen_stocks(
+    universe: str = "sp500",
+    max_rsi: float = 40.0,
+    min_rsi: float = 0.0,
+    require_above_ma200: bool = True,
+    require_above_ma50: bool = False,
+    min_analyst_upside_pct: float = 10.0,
+    max_pe: float = 0.0,
+    min_momentum_1m_pct: float = 0.0,
+    max_results: int = 20,
+) -> str:
+    """Scan a universe of stocks for high-conviction entry setups.
+
+    universe: "sp500" | "ftse100" | "both" | "watchlist" | comma-separated tickers
+    max_rsi: filter stocks with RSI below this (default 40 = oversold zone)
+    min_rsi: filter stocks with RSI above this (default 0 = no floor)
+    require_above_ma200: only include stocks trading above their 200-day MA
+    require_above_ma50: only include stocks trading above their 50-day MA
+    min_analyst_upside_pct: minimum analyst mean price target upside % (default 10)
+    max_pe: maximum trailing P/E ratio — 0 means no filter
+    min_momentum_1m_pct: minimum 1-month price return % — 0 means no filter
+    max_results: cap on number of results returned (default 20)
+
+    Example: screen_stocks(universe="sp500", max_rsi=35, require_above_ma200=True)
+    = find oversold S&P 500 names still in long-term uptrends — classic mean-reversion entry.
+    """
+
+    # Build ticker list
+    global _WATCHLIST
+    if universe == "sp500":
+        tickers = list(_SP500_TICKERS)
+    elif universe == "ftse100":
+        tickers = list(_FTSE100_TICKERS)
+    elif universe == "both":
+        tickers = list(_SP500_TICKERS) + list(_FTSE100_TICKERS)
+    elif universe == "watchlist":
+        try:
+            positions = await t212.get_portfolio()
+            tickers = [_strip_t212_ticker(p["ticker"]) for p in positions]
+        except Exception:
+            tickers = list(_WATCHLIST)
+    else:
+        tickers = [t.strip().upper() for t in universe.split(",") if t.strip()]
+
+    if not tickers:
+        return "No tickers to screen."
+
+    # --- Step 1: batch price download (1 year daily) ---
+    def _batch_download(syms):
+        raw = yf.download(syms, period="1y", interval="1d", auto_adjust=True, progress=False)
+        if isinstance(raw.columns, pd.MultiIndex):
+            return raw["Close"]
+        # Single ticker returns flat df
+        return raw[["Close"]].rename(columns={"Close": syms[0]})
+
+    try:
+        closes = await asyncio.to_thread(_batch_download, tickers)
+    except Exception as e:
+        return f"Error downloading price data: {e}"
+
+    closes = closes.dropna(how="all")
+    available = [c for c in closes.columns if closes[c].notna().sum() >= 60]
+    if not available:
+        return "Insufficient price data for the requested universe."
+
+    # --- Step 2: compute technicals per ticker in pandas (fast, no API calls) ---
+    candidates = []
+
+    for sym in available:
+        col = closes[sym].dropna()
+        if len(col) < 60:
+            continue
+
+        price = float(col.iloc[-1])
+
+        # MAs
+        ma50  = float(col.rolling(50).mean().iloc[-1])  if len(col) >= 50  else None
+        ma200 = float(col.rolling(200).mean().iloc[-1]) if len(col) >= 200 else None
+
+        # RSI (14)
+        delta = col.diff()
+        gain  = delta.clip(lower=0).rolling(14).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        rs    = gain.iloc[-1] / loss.iloc[-1] if loss.iloc[-1] != 0 else 0
+        rsi   = 100 - (100 / (1 + rs)) if loss.iloc[-1] != 0 else 100
+
+        # 1-month momentum
+        mom_1m = (price - float(col.iloc[-22])) / float(col.iloc[-22]) * 100 if len(col) >= 22 else None
+
+        # --- Apply technical filters ---
+        if rsi < min_rsi or rsi > max_rsi:
+            continue
+        if require_above_ma200 and (ma200 is None or price < ma200):
+            continue
+        if require_above_ma50 and (ma50 is None or price < ma50):
+            continue
+        if min_momentum_1m_pct and (mom_1m is None or mom_1m < min_momentum_1m_pct):
+            continue
+
+        candidates.append({
+            "ticker": sym,
+            "price":  price,
+            "rsi":    rsi,
+            "ma50":   ma50,
+            "ma200":  ma200,
+            "mom_1m": mom_1m,
+        })
+
+    if not candidates:
+        return (
+            f"No stocks passed technical filters in '{universe}' universe.\n"
+            f"Filters: RSI {min_rsi:.0f}–{max_rsi:.0f}, "
+            f"{'above MA200, ' if require_above_ma200 else ''}"
+            f"{'above MA50, ' if require_above_ma50 else ''}"
+            f"{'momentum ≥ ' + str(min_momentum_1m_pct) + '%, ' if min_momentum_1m_pct else ''}"
+            f"\nTry relaxing the criteria."
+        )
+
+    # --- Step 3: fetch fundamentals + analyst targets for technical candidates only ---
+    async def _get_fundamentals(sym):
+        def _fetch():
+            info = yf.Ticker(sym).info
+            return {
+                "pe":        info.get("trailingPE"),
+                "target":    info.get("targetMeanPrice"),
+                "cur_price": info.get("currentPrice") or info.get("regularMarketPrice"),
+                "rec":       info.get("recommendationKey", ""),
+                "name":      info.get("shortName") or sym,
+                "sector":    info.get("sector", ""),
+            }
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception:
+            return {}
+
+    fund_results = await asyncio.gather(*[_get_fundamentals(c["ticker"]) for c in candidates])
+
+    # Merge and apply fundamental filters
+    final = []
+    for c, f in zip(candidates, fund_results):
+        pe = f.get("pe")
+        target = f.get("target")
+        cur = f.get("cur_price") or c["price"]
+        upside = (float(target) - float(cur)) / float(cur) * 100 if target and cur else None
+
+        if max_pe and pe and pe > max_pe:
+            continue
+        if min_analyst_upside_pct and (upside is None or upside < min_analyst_upside_pct):
+            continue
+
+        final.append({**c, **f, "upside": upside})
+
+    if not final:
+        return (
+            f"Technical candidates found ({len(candidates)}) but none passed fundamental filters "
+            f"(analyst upside ≥ {min_analyst_upside_pct}%, "
+            f"{'P/E ≤ ' + str(max_pe) if max_pe else ''}).\n"
+            f"Try lowering min_analyst_upside_pct or removing max_pe."
+        )
+
+    # Sort by RSI ascending (most oversold first)
+    final.sort(key=lambda x: x["rsi"])
+    final = final[:max_results]
+
+    lines = [
+        f"**Stock Screener — {universe.upper()} universe**\n",
+        f"Filters: RSI {min_rsi:.0f}–{max_rsi:.0f}"
+        + (", above MA200" if require_above_ma200 else "")
+        + (", above MA50"  if require_above_ma50  else "")
+        + (f", analyst upside ≥ {min_analyst_upside_pct}%" if min_analyst_upside_pct else "")
+        + (f", P/E ≤ {max_pe}" if max_pe else "")
+        + "\n",
+        f"{'Ticker':<8} {'Name':<24} {'Price':>9} {'RSI':>6} {'1M%':>7} {'Upside%':>9} {'P/E':>7} {'Rec':<10} {'Sector'}",
+        "-" * 100,
+    ]
+
+    for s in final:
+        pe_str  = f"{s['pe']:.1f}" if s.get("pe") else "N/A"
+        up_str  = f"+{s['upside']:.1f}%" if s.get("upside") else "N/A"
+        mom_str = f"{s['mom_1m']:+.1f}%" if s.get("mom_1m") is not None else "N/A"
+        rec_str = (s.get("rec") or "").upper()[:9]
+        sector  = (s.get("sector") or "")[:18]
+        lines.append(
+            f"{s['ticker']:<8} {(s.get('name',''))[:23]:<24} {s['price']:>9,.2f} "
+            f"{s['rsi']:>6.1f} {mom_str:>7} {up_str:>9} {pe_str:>7} {rec_str:<10} {sector}"
+        )
+
+    lines.append(f"\n{len(final)} candidates — sorted by RSI ascending (most oversold first)")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Deep Research via Perplexity
+# ---------------------------------------------------------------------------
+
+PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY", "")
+
+
+@mcp.tool()
+async def research(query: str) -> str:
+    """Deep research synthesis using Perplexity AI — returns a cited, multi-source answer.
+    Better than web search for: earnings analysis, geopolitical context, sector deep-dives,
+    analyst report synthesis, macro themes, or any question needing reasoned synthesis.
+    Requires PERPLEXITY_API_KEY in .env.
+    Examples: 'Why is the energy sector outperforming in Q2 2025?'
+              'NVDA competitive moat vs AMD in AI inference chips'
+              'Impact of US-China tariffs on semiconductor supply chain'"""
+
+    if not PERPLEXITY_API_KEY:
+        return (
+            "PERPLEXITY_API_KEY not set. Add it to .env:\n"
+            "  PERPLEXITY_API_KEY=pplx-xxxx\n"
+            "Get a key at https://www.perplexity.ai/settings/api"
+        )
+
+    import httpx
+
+    payload = {
+        "model": "sonar",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a financial research analyst. Provide concise, factual, "
+                    "well-sourced answers. Include relevant data points, dates, and cite sources."
+                ),
+            },
+            {"role": "user", "content": query},
+        ],
+        "max_tokens": 1024,
+        "return_citations": True,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.perplexity.ai/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        return f"Error calling Perplexity API: {e}"
+
+    content = data.get("choices", [{}])[0].get("message", {}).get("content", "No response.")
+    citations = data.get("citations", [])
+
+    lines = [f"**Research: {query}**\n", content]
+    if citations:
+        lines.append("\n**Sources**")
+        for i, url in enumerate(citations[:6], 1):
+            lines.append(f"{i}. {url}")
 
     return "\n".join(lines)
 
