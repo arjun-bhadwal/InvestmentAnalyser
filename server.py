@@ -1,13 +1,16 @@
 import asyncio
+import hashlib
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from functools import wraps
 
 import finnhub
 import numpy as np
 import pandas as pd
 import ta as ta_lib
 import yfinance as yf
+from cachetools import TTLCache
 from duckduckgo_search import DDGS
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -21,8 +24,32 @@ T212_API_KEY = os.environ["T212_API_KEY"]
 T212_API_SECRET = os.environ["T212_API_SECRET"]
 FINNHUB_API_KEY = os.environ["FINNHUB_API_KEY"]
 T212_MODE = os.environ.get("T212_MODE", "demo")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 
 t212: T212Client
+
+# ---------------------------------------------------------------------------
+# Caching — avoids repeated expensive API calls within TTL windows
+# ---------------------------------------------------------------------------
+
+_cache_fundamentals = TTLCache(maxsize=128, ttl=900)    # 15 min
+_cache_prices       = TTLCache(maxsize=64,  ttl=300)    # 5 min
+_cache_macro        = TTLCache(maxsize=16,  ttl=3600)   # 1 hour
+
+
+def _cached(cache: TTLCache):
+    """Decorator to cache async function results by args hash."""
+    def decorator(fn):
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            key = hashlib.md5(f"{fn.__name__}:{args}:{kwargs}".encode()).hexdigest()
+            if key in cache:
+                return cache[key]
+            result = await fn(*args, **kwargs)
+            cache[key] = result
+            return result
+        return wrapper
+    return decorator
 
 
 @asynccontextmanager
@@ -875,7 +902,13 @@ async def get_portfolio_risk() -> str:
     returns = closes.pct_change().dropna()
 
     TRADING_DAYS = 252
-    RISK_FREE     = 0.045  # ~4.5% annualised (approx UK/US rate)
+
+    # Dynamic risk-free rate from 10-Year Treasury yield
+    try:
+        _rf_info = yf.Ticker("^TNX").fast_info
+        RISK_FREE = float(_rf_info.last_price) / 100  # ^TNX quotes in %, e.g. 4.5 → 0.045
+    except Exception:
+        RISK_FREE = 0.045  # fallback
 
     lines = ["**Portfolio Risk Analytics — 1-Year Lookback**\n"]
 
@@ -1456,6 +1489,966 @@ async def research(query: str) -> str:
         lines.append("\n**Sources**")
         for i, url in enumerate(citations[:6], 1):
             lines.append(f"{i}. {url}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Macro Economic Dashboard
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+@_cached(_cache_macro)
+async def get_macro_dashboard() -> str:
+    """Return key macroeconomic indicators: interest rates, yield curve, inflation,
+    GDP growth, unemployment, VIX fear index, and USD strength.
+    Use this for macro context before making investment decisions."""
+
+    lines = [f"**Macro Economic Dashboard — {datetime.today().strftime('%d %b %Y')}**\n"]
+
+    # --- Market-based indicators via yfinance (always available) ---
+    market_syms = {
+        "10Y Treasury (^TNX)": "^TNX",
+        "2Y Treasury (^IRX proxy)": "^TWO",
+        "VIX Fear Index (^VIX)": "^VIX",
+        "US Dollar Index (DX-Y.NYB)": "DX-Y.NYB",
+        "Gold (GC=F)": "GC=F",
+        "Crude Oil (CL=F)": "CL=F",
+    }
+
+    def _fetch_market():
+        results = {}
+        for label, sym in market_syms.items():
+            try:
+                t = yf.Ticker(sym)
+                fi = t.fast_info
+                price = fi.last_price
+                prev = fi.previous_close
+                chg = ((price - prev) / prev * 100) if prev else 0
+                results[label] = (price, chg)
+            except Exception:
+                results[label] = (None, None)
+        return results
+
+    try:
+        market = await asyncio.to_thread(_fetch_market)
+    except Exception as e:
+        market = {}
+        lines.append(f"⚠ Market data error: {e}\n")
+
+    if market:
+        lines.append("**Market Indicators**")
+        for label, (price, chg) in market.items():
+            if price is not None:
+                sign = "+" if chg >= 0 else ""
+                lines.append(f"- {label}: {price:,.2f}  ({sign}{chg:.2f}%)")
+            else:
+                lines.append(f"- {label}: N/A")
+
+        # Yield curve interpretation
+        tnx = market.get("10Y Treasury (^TNX)", (None,))[0]
+        if tnx is not None:
+            lines.append(f"\n**Yield Curve**")
+            lines.append(f"- 10Y yield: {tnx:.2f}%")
+
+        vix = market.get("VIX Fear Index (^VIX)", (None,))[0]
+        if vix is not None:
+            if vix < 15:
+                vix_signal = "LOW FEAR — complacency, potential for surprise vol"
+            elif vix < 20:
+                vix_signal = "NORMAL — market calm"
+            elif vix < 30:
+                vix_signal = "ELEVATED — uncertainty, caution warranted"
+            else:
+                vix_signal = "HIGH FEAR — panic selling, contrarian buy zone"
+            lines.append(f"\n**VIX Signal:** {vix_signal}")
+
+    # --- FRED economic data (if API key available) ---
+    if FRED_API_KEY:
+        try:
+            from fredapi import Fred
+            fred = Fred(api_key=FRED_API_KEY)
+
+            indicators = {
+                "Fed Funds Rate": "FEDFUNDS",
+                "CPI YoY %": "CPIAUCSL",
+                "Core CPI YoY %": "CPILFESL",
+                "Unemployment Rate %": "UNRATE",
+                "Real GDP Growth % (QoQ)": "A191RL1Q225SBEA",
+                "Consumer Confidence": "UMCSENT",
+                "10Y-2Y Spread (bp)": "T10Y2Y",
+            }
+
+            lines.append("\n**Economic Indicators (FRED)**")
+            for label, series_id in indicators.items():
+                try:
+                    data = fred.get_series(series_id, observation_start=(datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d"))
+                    if data is not None and len(data) > 0:
+                        val = float(data.dropna().iloc[-1])
+                        lines.append(f"- {label}: {val:.2f}")
+                except Exception:
+                    lines.append(f"- {label}: N/A")
+
+            # Yield curve inversion warning
+            try:
+                spread = fred.get_series("T10Y2Y")
+                if spread is not None and len(spread) > 0:
+                    latest_spread = float(spread.dropna().iloc[-1])
+                    if latest_spread < 0:
+                        lines.append(f"\n> ⚠️ **YIELD CURVE INVERTED** ({latest_spread:.2f}%) — historically precedes recession by 6-18 months")
+                    elif latest_spread < 0.5:
+                        lines.append(f"\n> ⚡ Yield curve flattening ({latest_spread:.2f}%) — watch for inversion")
+            except Exception:
+                pass
+
+        except ImportError:
+            lines.append("\n⚠ Install fredapi: `pip install fredapi`")
+        except Exception as e:
+            lines.append(f"\n⚠ FRED error: {e}")
+    else:
+        lines.append("\n💡 Set FRED_API_KEY in .env for economic indicators (CPI, GDP, unemployment). Free at https://fred.stlouisfed.org/docs/api/api_key.html")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@_cached(_cache_prices)
+async def get_fear_greed_index() -> str:
+    """Return a composite Fear & Greed score (0-100) based on market breadth, momentum,
+    VIX, and safe haven demand. 0=Extreme Fear, 100=Extreme Greed.
+    Use this to gauge overall market sentiment before making buy/sell decisions."""
+
+    def _fetch():
+        data = {}
+        # VIX
+        try:
+            data["vix"] = float(yf.Ticker("^VIX").fast_info.last_price)
+        except Exception:
+            data["vix"] = None
+
+        # SPY momentum vs 125-day MA
+        try:
+            spy = yf.Ticker("SPY").history(period="6mo", interval="1d", auto_adjust=True)["Close"]
+            data["spy_price"] = float(spy.iloc[-1])
+            data["spy_ma125"] = float(spy.rolling(125).mean().iloc[-1])
+        except Exception:
+            data["spy_price"] = data["spy_ma125"] = None
+
+        # Market breadth: % of SPY-correlated ETFs above their 50-day MA
+        breadth_syms = ["XLK", "XLF", "XLV", "XLE", "XLI", "XLB", "XLRE", "XLU", "XLP", "XLY", "XLC"]
+        above_ma = 0
+        total = 0
+        for sym in breadth_syms:
+            try:
+                h = yf.Ticker(sym).history(period="3mo", interval="1d", auto_adjust=True)["Close"]
+                if len(h) >= 50:
+                    total += 1
+                    if float(h.iloc[-1]) > float(h.rolling(50).mean().iloc[-1]):
+                        above_ma += 1
+            except Exception:
+                pass
+        data["breadth_pct"] = (above_ma / total * 100) if total > 0 else None
+
+        # Safe haven demand: gold vs SPY 20-day relative performance
+        try:
+            gold = yf.Ticker("GLD").history(period="1mo", interval="1d", auto_adjust=True)["Close"]
+            spy_h = yf.Ticker("SPY").history(period="1mo", interval="1d", auto_adjust=True)["Close"]
+            gold_ret = (float(gold.iloc[-1]) - float(gold.iloc[0])) / float(gold.iloc[0]) * 100
+            spy_ret = (float(spy_h.iloc[-1]) - float(spy_h.iloc[0])) / float(spy_h.iloc[0]) * 100
+            data["safe_haven_diff"] = gold_ret - spy_ret
+        except Exception:
+            data["safe_haven_diff"] = None
+
+        return data
+
+    try:
+        d = await asyncio.to_thread(_fetch)
+    except Exception as e:
+        return f"Error computing Fear & Greed Index: {e}"
+
+    scores = []
+    components = []
+
+    # 1. VIX score (inverted: low VIX = greed)
+    if d["vix"] is not None:
+        vix = d["vix"]
+        vix_score = max(0, min(100, 100 - (vix - 12) * (100 / 28)))
+        scores.append(vix_score)
+        label = "Extreme Fear" if vix > 30 else "Fear" if vix > 20 else "Neutral" if vix > 15 else "Greed" if vix > 12 else "Extreme Greed"
+        components.append(f"- VIX ({vix:.1f}): **{label}** → score {vix_score:.0f}")
+
+    # 2. Momentum: SPY vs 125-day MA
+    if d["spy_price"] is not None and d["spy_ma125"] is not None:
+        pct_above = (d["spy_price"] / d["spy_ma125"] - 1) * 100
+        mom_score = max(0, min(100, 50 + pct_above * 5))
+        scores.append(mom_score)
+        label = "Greedy" if pct_above > 5 else "Fearful" if pct_above < -5 else "Neutral"
+        components.append(f"- Momentum (SPY {pct_above:+.1f}% vs MA125): **{label}** → score {mom_score:.0f}")
+
+    # 3. Market breadth
+    if d["breadth_pct"] is not None:
+        breadth_score = d["breadth_pct"]
+        scores.append(breadth_score)
+        label = "Strong" if breadth_score > 70 else "Weak" if breadth_score < 30 else "Mixed"
+        components.append(f"- Breadth ({breadth_score:.0f}% sectors above MA50): **{label}** → score {breadth_score:.0f}")
+
+    # 4. Safe haven demand (inverted: gold outperforming = fear)
+    if d["safe_haven_diff"] is not None:
+        sh = d["safe_haven_diff"]
+        sh_score = max(0, min(100, 50 - sh * 5))
+        scores.append(sh_score)
+        label = "Fear (gold leading)" if sh > 2 else "Greed (risk-on)" if sh < -2 else "Neutral"
+        components.append(f"- Safe Haven (Gold vs SPY 1M: {sh:+.1f}%): **{label}** → score {sh_score:.0f}")
+
+    if not scores:
+        return "Could not compute Fear & Greed Index — insufficient data."
+
+    composite = sum(scores) / len(scores)
+
+    if composite <= 20:
+        reading = "🔴 EXTREME FEAR"
+    elif composite <= 40:
+        reading = "🟠 FEAR"
+    elif composite <= 60:
+        reading = "🟡 NEUTRAL"
+    elif composite <= 80:
+        reading = "🟢 GREED"
+    else:
+        reading = "🟢 EXTREME GREED"
+
+    lines = [
+        f"**Fear & Greed Index — {datetime.today().strftime('%d %b %Y')}**\n",
+        f"## {reading} — Score: {composite:.0f}/100\n",
+        "**Components:**",
+    ] + components + [
+        "",
+        "**Interpretation:**",
+        "- 0-25: Extreme Fear — contrarian buy opportunities",
+        "- 25-45: Fear — cautious positioning",
+        "- 45-55: Neutral",
+        "- 55-75: Greed — momentum favours bulls",
+        "- 75-100: Extreme Greed — caution, potential top",
+    ]
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Financial Statements
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+@_cached(_cache_fundamentals)
+async def get_financial_statements(ticker: str) -> str:
+    """Return income statement, balance sheet, and cash flow highlights for a stock.
+    Shows last 4 annual periods with key ratios: ROE, ROA, current ratio, D/E, FCF yield.
+    Use this for deep fundamental analysis beyond the basics."""
+
+    def _fetch():
+        t = yf.Ticker(ticker)
+        return {
+            "info": t.info,
+            "income": t.income_stmt,
+            "balance": t.balance_sheet,
+            "cashflow": t.cashflow,
+        }
+
+    try:
+        d = await asyncio.to_thread(_fetch)
+    except Exception as e:
+        return f"Error fetching financial statements for {ticker}: {e}"
+
+    info = d["info"]
+    name = info.get("longName") or ticker.upper()
+    currency = info.get("currency", "USD")
+
+    def _b(val):
+        """Format large numbers as billions/millions."""
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            return "N/A"
+        v = float(val)
+        if abs(v) >= 1e9:
+            return f"{v/1e9:,.1f}B"
+        if abs(v) >= 1e6:
+            return f"{v/1e6:,.0f}M"
+        return f"{v:,.0f}"
+
+    lines = [f"**{name} ({ticker.upper()}) — Financial Statements ({currency})**\n"]
+
+    # --- Income Statement ---
+    inc = d["income"]
+    if inc is not None and not inc.empty:
+        lines.append("**Income Statement (Annual)**")
+        rows = ["Total Revenue", "Gross Profit", "Operating Income", "Net Income", "EBITDA"]
+        header = f"{'Metric':<22}" + "".join(f"{c.strftime('%Y'):>12}" for c in inc.columns[:4])
+        lines.append(header)
+        lines.append("-" * (22 + 12 * min(4, len(inc.columns))))
+        for row in rows:
+            if row in inc.index:
+                vals = "".join(f"{_b(inc.loc[row, c]):>12}" for c in inc.columns[:4])
+                lines.append(f"{row:<22}{vals}")
+        lines.append("")
+
+    # --- Balance Sheet ---
+    bal = d["balance"]
+    if bal is not None and not bal.empty:
+        lines.append("**Balance Sheet (Annual)**")
+        rows = ["Total Assets", "Total Liabilities Net Minority Interest",
+                "Stockholders Equity", "Total Debt", "Cash And Cash Equivalents"]
+        header = f"{'Metric':<40}" + "".join(f"{c.strftime('%Y'):>12}" for c in bal.columns[:4])
+        lines.append(header)
+        lines.append("-" * (40 + 12 * min(4, len(bal.columns))))
+        for row in rows:
+            if row in bal.index:
+                vals = "".join(f"{_b(bal.loc[row, c]):>12}" for c in bal.columns[:4])
+                display = row[:39]
+                lines.append(f"{display:<40}{vals}")
+        lines.append("")
+
+    # --- Cash Flow ---
+    cf = d["cashflow"]
+    if cf is not None and not cf.empty:
+        lines.append("**Cash Flow (Annual)**")
+        rows = ["Operating Cash Flow", "Capital Expenditure", "Free Cash Flow",
+                "Repurchase Of Capital Stock", "Cash Dividends Paid"]
+        header = f"{'Metric':<30}" + "".join(f"{c.strftime('%Y'):>12}" for c in cf.columns[:4])
+        lines.append(header)
+        lines.append("-" * (30 + 12 * min(4, len(cf.columns))))
+        for row in rows:
+            if row in cf.index:
+                vals = "".join(f"{_b(cf.loc[row, c]):>12}" for c in cf.columns[:4])
+                lines.append(f"{row:<30}{vals}")
+        lines.append("")
+
+    # --- Key Ratios ---
+    lines.append("**Key Ratios**")
+    try:
+        if bal is not None and not bal.empty and inc is not None and not inc.empty:
+            latest_bal = bal.iloc[:, 0]
+            latest_inc = inc.iloc[:, 0]
+            equity = float(latest_bal.get("Stockholders Equity", 0) or 0)
+            assets = float(latest_bal.get("Total Assets", 0) or 0)
+            net_income = float(latest_inc.get("Net Income", 0) or 0)
+            total_debt = float(latest_bal.get("Total Debt", 0) or 0)
+            current_assets = float(latest_bal.get("Current Assets", 0) or 0)
+            current_liab = float(latest_bal.get("Current Liabilities", 0) or 0)
+
+            roe = (net_income / equity * 100) if equity else None
+            roa = (net_income / assets * 100) if assets else None
+            de = (total_debt / equity) if equity else None
+            current_ratio = (current_assets / current_liab) if current_liab else None
+
+            lines.append(f"- ROE: {roe:.1f}%" if roe else "- ROE: N/A")
+            lines.append(f"- ROA: {roa:.1f}%" if roa else "- ROA: N/A")
+            lines.append(f"- Debt/Equity: {de:.2f}" if de else "- Debt/Equity: N/A")
+            lines.append(f"- Current Ratio: {current_ratio:.2f}" if current_ratio else "- Current Ratio: N/A")
+
+        if cf is not None and not cf.empty:
+            fcf = float(cf.iloc[:, 0].get("Free Cash Flow", 0) or 0)
+            mcap = float(info.get("marketCap", 0) or 0)
+            fcf_yield = (fcf / mcap * 100) if mcap else None
+            lines.append(f"- FCF Yield: {fcf_yield:.2f}%" if fcf_yield else "- FCF Yield: N/A")
+    except Exception:
+        lines.append("- Could not compute ratios")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# DCF Valuation
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+@_cached(_cache_fundamentals)
+async def get_dcf_valuation(ticker: str, growth_rate_pct: float = 0.0, discount_rate_pct: float = 10.0) -> str:
+    """Estimate intrinsic value using a Discounted Cash Flow (DCF) model.
+    Uses free cash flow from financials, analyst growth estimates, and WACC.
+    growth_rate_pct: override FCF growth rate (0 = auto-detect from analyst estimates)
+    discount_rate_pct: discount rate / WACC (default 10%)
+    Returns intrinsic value per share and margin of safety vs current price."""
+
+    def _fetch():
+        t = yf.Ticker(ticker)
+        return t.info, t.cashflow
+
+    try:
+        info, cf = await asyncio.to_thread(_fetch)
+    except Exception as e:
+        return f"Error fetching data for DCF: {e}"
+
+    name = info.get("longName") or ticker.upper()
+    currency = info.get("currency", "USD")
+    current_price = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0)
+    shares = float(info.get("sharesOutstanding", 0) or 0)
+
+    if not shares or not current_price:
+        return f"Insufficient data for DCF on {ticker} (missing price or shares outstanding)."
+
+    # Get FCF
+    if cf is None or cf.empty or "Free Cash Flow" not in cf.index:
+        return f"No free cash flow data available for {ticker}."
+
+    fcf_values = [float(v) for v in cf.loc["Free Cash Flow"].dropna().values[:4] if not np.isnan(float(v))]
+    if not fcf_values:
+        return f"No valid FCF data for {ticker}."
+
+    latest_fcf = fcf_values[0]
+    if latest_fcf <= 0:
+        return f"{ticker} has negative FCF ({currency} {latest_fcf/1e9:.2f}B) — DCF not applicable for negative cash flow companies."
+
+    # Growth rate
+    if growth_rate_pct == 0:
+        analyst_growth = info.get("earningsGrowth") or info.get("revenueGrowth")
+        if analyst_growth:
+            growth_rate = float(analyst_growth)
+        elif len(fcf_values) >= 2 and fcf_values[-1] > 0:
+            growth_rate = (fcf_values[0] / fcf_values[-1]) ** (1 / (len(fcf_values) - 1)) - 1
+        else:
+            growth_rate = 0.05
+    else:
+        growth_rate = growth_rate_pct / 100
+
+    discount_rate = discount_rate_pct / 100
+    terminal_growth = 0.025  # 2.5% long-term growth
+    projection_years = 10
+
+    # Project FCFs
+    projected_fcfs = []
+    fcf = latest_fcf
+    for year in range(1, projection_years + 1):
+        fcf *= (1 + growth_rate)
+        pv = fcf / (1 + discount_rate) ** year
+        projected_fcfs.append((year, fcf, pv))
+
+    # Terminal value
+    terminal_fcf = projected_fcfs[-1][1] * (1 + terminal_growth)
+    terminal_value = terminal_fcf / (discount_rate - terminal_growth)
+    pv_terminal = terminal_value / (1 + discount_rate) ** projection_years
+
+    # Enterprise value and equity value
+    total_pv_fcf = sum(pv for _, _, pv in projected_fcfs)
+    enterprise_value = total_pv_fcf + pv_terminal
+
+    # Adjust for cash and debt
+    cash = float(info.get("totalCash", 0) or 0)
+    debt = float(info.get("totalDebt", 0) or 0)
+    equity_value = enterprise_value + cash - debt
+    intrinsic_per_share = equity_value / shares
+
+    margin_of_safety = (intrinsic_per_share - current_price) / intrinsic_per_share * 100
+
+    def _b(v):
+        return f"{v/1e9:,.2f}B" if abs(v) >= 1e9 else f"{v/1e6:,.0f}M"
+
+    lines = [
+        f"**{name} ({ticker.upper()}) — DCF Valuation**\n",
+        f"**Inputs**",
+        f"- Latest FCF: {currency} {_b(latest_fcf)}",
+        f"- Growth rate: {growth_rate*100:.1f}% (years 1-{projection_years})",
+        f"- Discount rate (WACC): {discount_rate*100:.1f}%",
+        f"- Terminal growth: {terminal_growth*100:.1f}%",
+        f"- Projection period: {projection_years} years",
+        "",
+        f"**Projected FCF**",
+    ]
+
+    for yr, fcf_val, pv_val in projected_fcfs[:5]:
+        lines.append(f"  Year {yr}: FCF {_b(fcf_val)}  →  PV {_b(pv_val)}")
+    if projection_years > 5:
+        lines.append(f"  ... (years 6-{projection_years} omitted)")
+
+    verdict = "UNDERVALUED ✅" if margin_of_safety > 15 else "FAIRLY VALUED ⚖️" if margin_of_safety > -10 else "OVERVALUED ⚠️"
+
+    lines += [
+        "",
+        f"**Valuation**",
+        f"- PV of projected FCFs: {currency} {_b(total_pv_fcf)}",
+        f"- PV of terminal value: {currency} {_b(pv_terminal)}",
+        f"- Enterprise value:     {currency} {_b(enterprise_value)}",
+        f"- + Cash:               {currency} {_b(cash)}",
+        f"- - Debt:               {currency} {_b(debt)}",
+        f"- **Equity value:       {currency} {_b(equity_value)}**",
+        "",
+        f"**Result**",
+        f"- Intrinsic value/share: **{currency} {intrinsic_per_share:,.2f}**",
+        f"- Current price:         {currency} {current_price:,.2f}",
+        f"- Margin of safety:      {margin_of_safety:+.1f}%",
+        f"- Verdict:               **{verdict}**",
+        "",
+        f"⚠️ DCF is highly sensitive to growth and discount rate assumptions. Use as one input among many.",
+    ]
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Peer Comparison
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+@_cached(_cache_fundamentals)
+async def compare_peers(tickers: str) -> str:
+    """Compare 2-6 stocks side-by-side on fundamentals, technicals, and analyst views.
+    tickers: comma-separated list, e.g. 'AAPL,MSFT,GOOGL'
+    Returns valuation, growth, margins, momentum, and analyst consensus comparison."""
+
+    symbols = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if len(symbols) < 2:
+        return "Provide at least 2 tickers separated by commas, e.g. 'AAPL,MSFT,GOOGL'"
+    symbols = symbols[:6]
+
+    async def _get_info(sym):
+        def _f():
+            t = yf.Ticker(sym)
+            info = t.info
+            hist = t.history(period="1y", interval="1d", auto_adjust=True)
+            return info, hist
+        try:
+            return sym, *(await asyncio.to_thread(_f))
+        except Exception:
+            return sym, {}, pd.DataFrame()
+
+    results = await asyncio.gather(*[_get_info(s) for s in symbols])
+
+    # Build comparison table
+    metrics = [
+        ("Name", lambda i, h: (i.get("shortName") or "")[:20]),
+        ("Sector", lambda i, h: (i.get("sector") or "")[:15]),
+        ("Mkt Cap", lambda i, h: f"{float(i.get('marketCap',0) or 0)/1e9:.0f}B" if i.get("marketCap") else "N/A"),
+        ("P/E (TTM)", lambda i, h: f"{float(i['trailingPE']):.1f}" if i.get("trailingPE") else "N/A"),
+        ("P/E (Fwd)", lambda i, h: f"{float(i['forwardPE']):.1f}" if i.get("forwardPE") else "N/A"),
+        ("EV/EBITDA", lambda i, h: f"{float(i['enterpriseToEbitda']):.1f}" if i.get("enterpriseToEbitda") else "N/A"),
+        ("P/B", lambda i, h: f"{float(i['priceToBook']):.1f}" if i.get("priceToBook") else "N/A"),
+        ("Rev Growth", lambda i, h: f"{float(i['revenueGrowth'])*100:.1f}%" if i.get("revenueGrowth") else "N/A"),
+        ("Profit Margin", lambda i, h: f"{float(i['profitMargins'])*100:.1f}%" if i.get("profitMargins") else "N/A"),
+        ("ROE", lambda i, h: f"{float(i['returnOnEquity'])*100:.1f}%" if i.get("returnOnEquity") else "N/A"),
+        ("Div Yield", lambda i, h: f"{float(i['dividendYield'])*100:.2f}%" if i.get("dividendYield") else "N/A"),
+        ("Beta", lambda i, h: f"{float(i['beta']):.2f}" if i.get("beta") else "N/A"),
+        ("52w Chg", lambda i, h: f"{float(i['52WeekChange'])*100:+.1f}%" if i.get("52WeekChange") else "N/A"),
+        ("Analyst", lambda i, h: (i.get("recommendationKey") or "N/A").upper()),
+        ("Target Upside", lambda i, h: (
+            f"{(float(i['targetMeanPrice']) - float(i.get('currentPrice', i.get('regularMarketPrice', 0)) or 1)) / float(i.get('currentPrice', i.get('regularMarketPrice', 0)) or 1) * 100:+.1f}%"
+            if i.get("targetMeanPrice") and (i.get("currentPrice") or i.get("regularMarketPrice")) else "N/A"
+        )),
+    ]
+
+    col_w = 14
+    lines = [f"**Peer Comparison**\n"]
+    header = f"{'Metric':<16}" + "".join(f"{sym:>{col_w}}" for sym, _, _ in results)
+    lines.append(header)
+    lines.append("-" * (16 + col_w * len(results)))
+
+    for metric_name, extractor in metrics:
+        row = f"{metric_name:<16}"
+        for sym, info, hist in results:
+            try:
+                val = extractor(info, hist)
+            except Exception:
+                val = "N/A"
+            row += f"{val:>{col_w}}"
+        lines.append(row)
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Position Sizing
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def calculate_position_size(
+    ticker: str,
+    entry_price: float,
+    stop_loss_price: float,
+    risk_pct: float = 2.0,
+) -> str:
+    """Calculate optimal position size for a trade based on risk management rules.
+    ticker: stock ticker
+    entry_price: planned entry price
+    stop_loss_price: stop-loss price level
+    risk_pct: max portfolio risk per trade (default 2%)
+    Returns position size, number of shares, Kelly Criterion estimate, and concentration impact."""
+
+    try:
+        acct = await t212.get_account_summary()
+    except Exception as e:
+        return f"Error fetching account: {e}"
+
+    total_value = float(acct.get("totalValue", 0) or 0)
+    if total_value <= 0:
+        return "Could not determine portfolio value."
+
+    risk_per_share = abs(entry_price - stop_loss_price)
+    if risk_per_share <= 0:
+        return "Stop loss must be different from entry price."
+
+    max_risk_amount = total_value * (risk_pct / 100)
+    shares = int(max_risk_amount / risk_per_share)
+    position_value = shares * entry_price
+    position_pct = (position_value / total_value) * 100
+
+    # Kelly Criterion estimate using analyst win rate proxy
+    def _fetch_info():
+        return yf.Ticker(ticker).info
+
+    try:
+        info = await asyncio.to_thread(_fetch_info)
+        target = info.get("targetMeanPrice")
+        current = info.get("currentPrice") or info.get("regularMarketPrice") or entry_price
+        if target and current:
+            win_amount = abs(float(target) - entry_price)
+            loss_amount = risk_per_share
+            # Estimate win probability from analyst consensus
+            rec = (info.get("recommendationKey") or "").lower()
+            win_prob = {"strong_buy": 0.65, "buy": 0.6, "hold": 0.5, "sell": 0.4, "strong_sell": 0.35}.get(rec, 0.5)
+            b = win_amount / loss_amount if loss_amount > 0 else 1
+            kelly = win_prob - ((1 - win_prob) / b) if b > 0 else 0
+            kelly = max(0, kelly)
+        else:
+            kelly = None
+            win_prob = None
+    except Exception:
+        kelly = None
+        win_prob = None
+
+    currency = acct.get("currency", "")
+
+    lines = [
+        f"**Position Size Calculator — {ticker.upper()}**\n",
+        f"**Trade Setup**",
+        f"- Entry price:      {currency} {entry_price:,.2f}",
+        f"- Stop loss:        {currency} {stop_loss_price:,.2f}",
+        f"- Risk per share:   {currency} {risk_per_share:,.2f}",
+        f"- Direction:        {'LONG' if entry_price > stop_loss_price else 'SHORT'}",
+        "",
+        f"**Risk Management**",
+        f"- Portfolio value:  {currency} {total_value:,.2f}",
+        f"- Max risk ({risk_pct}%):  {currency} {max_risk_amount:,.2f}",
+        f"- **Shares to buy:  {shares:,}**",
+        f"- Position value:   {currency} {position_value:,.2f}",
+        f"- Portfolio weight:  {position_pct:.1f}%",
+    ]
+
+    if kelly is not None:
+        kelly_shares = int(kelly * total_value / entry_price)
+        lines += [
+            "",
+            f"**Kelly Criterion**",
+            f"- Win probability: {win_prob*100:.0f}% (from analyst consensus)",
+            f"- Kelly fraction:  {kelly*100:.1f}%",
+            f"- Kelly position:  {kelly_shares:,} shares ({currency} {kelly_shares * entry_price:,.2f})",
+            f"- Recommended:     Use **half-Kelly** ({kelly_shares // 2:,} shares) for safety",
+        ]
+
+    # Concentration warning
+    if position_pct > 20:
+        lines.append(f"\n⚠️ **CONCENTRATION WARNING**: {position_pct:.1f}% is very high. Consider reducing to <10%.")
+    elif position_pct > 10:
+        lines.append(f"\n⚡ Position is {position_pct:.1f}% of portfolio — moderate concentration.")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Portfolio Stress Test
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_portfolio_stress_test(simulations: int = 1000) -> str:
+    """Run stress tests on your portfolio: historical crisis scenarios and Monte Carlo simulation.
+    simulations: number of Monte Carlo runs (default 1000)
+    Returns expected drawdowns under 2008 crisis, COVID crash, 2022 rate hikes, and probability distribution."""
+
+    try:
+        positions = await t212.get_portfolio()
+    except Exception as e:
+        return f"Error fetching portfolio: {e}"
+
+    if not positions:
+        return "No open positions to stress test."
+
+    tickers = [_strip_t212_ticker(p["ticker"]) for p in positions]
+    weights_raw = {_strip_t212_ticker(p["ticker"]): float(p.get("currentPrice", 1) or 1) * float(p.get("quantity", 0) or 0) for p in positions}
+    total_val = sum(weights_raw.values()) or 1
+    weights = {k: v / total_val for k, v in weights_raw.items()}
+
+    def _fetch():
+        return yf.download(tickers, period="5y", interval="1d", auto_adjust=True, progress=False)
+
+    try:
+        data = await asyncio.to_thread(_fetch)
+    except Exception as e:
+        return f"Error fetching price history: {e}"
+
+    closes = data["Close"].dropna(how="all") if isinstance(data.columns, pd.MultiIndex) else data[["Close"]].rename(columns={"Close": tickers[0]})
+    returns = closes.pct_change().dropna()
+
+    lines = ["**Portfolio Stress Test**\n"]
+
+    # --- Historical scenarios ---
+    scenarios = {
+        "2008 Financial Crisis": ("2008-09-01", "2009-03-09"),
+        "COVID Crash (2020)": ("2020-02-19", "2020-03-23"),
+        "2022 Rate Hike Selloff": ("2022-01-03", "2022-10-12"),
+        "2024 Aug VIX Spike": ("2024-07-16", "2024-08-05"),
+    }
+
+    lines.append("**Historical Scenario Analysis**")
+    lines.append(f"{'Scenario':<28} {'Est. Portfolio Impact':>22}")
+    lines.append("-" * 52)
+
+    for scenario_name, (start, end) in scenarios.items():
+        try:
+            period_returns = returns.loc[start:end]
+            if period_returns.empty:
+                lines.append(f"{scenario_name:<28} {'no data':>22}")
+                continue
+            port_ret = sum(period_returns.get(t, pd.Series([0])).sum() * weights.get(t, 0) for t in tickers)
+            lines.append(f"{scenario_name:<28} {port_ret*100:>+20.1f}%")
+        except Exception:
+            lines.append(f"{scenario_name:<28} {'N/A':>22}")
+
+    # --- Monte Carlo simulation ---
+    lines.append(f"\n**Monte Carlo Simulation ({simulations:,} runs, 1-year horizon)**")
+
+    available_tickers = [t for t in tickers if t in returns.columns]
+    if not available_tickers:
+        lines.append("Insufficient data for Monte Carlo simulation.")
+        return "\n".join(lines)
+
+    port_returns = sum(returns[t] * weights.get(t, 0) for t in available_tickers).dropna()
+
+    if len(port_returns) < 20:
+        lines.append("Insufficient return history for Monte Carlo.")
+        return "\n".join(lines)
+
+    mean_ret = float(port_returns.mean())
+    std_ret = float(port_returns.std())
+
+    np.random.seed(42)
+    sim_results = []
+    for _ in range(simulations):
+        daily_returns = np.random.normal(mean_ret, std_ret, 252)
+        cumulative = np.cumprod(1 + daily_returns)
+        sim_results.append(float(cumulative[-1] - 1))
+
+    sim_results.sort()
+    p5 = sim_results[int(0.05 * simulations)]
+    p25 = sim_results[int(0.25 * simulations)]
+    p50 = sim_results[int(0.50 * simulations)]
+    p75 = sim_results[int(0.75 * simulations)]
+    p95 = sim_results[int(0.95 * simulations)]
+
+    lines += [
+        f"- 5th percentile (worst case):  {p5*100:+.1f}%",
+        f"- 25th percentile:              {p25*100:+.1f}%",
+        f"- **Median outcome:             {p50*100:+.1f}%**",
+        f"- 75th percentile:              {p75*100:+.1f}%",
+        f"- 95th percentile (best case):  {p95*100:+.1f}%",
+        "",
+        f"- Probability of loss: {sum(1 for r in sim_results if r < 0) / simulations * 100:.1f}%",
+        f"- Probability of >20% gain: {sum(1 for r in sim_results if r > 0.2) / simulations * 100:.1f}%",
+        f"- Probability of >20% loss: {sum(1 for r in sim_results if r < -0.2) / simulations * 100:.1f}%",
+    ]
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Insider Trades
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+@_cached(_cache_fundamentals)
+async def get_insider_trades(ticker: str) -> str:
+    """Return recent insider buy/sell activity for a stock via Finnhub.
+    Insider buying is one of the most reliable bullish signals.
+    Use this to check whether company insiders are putting their own money in."""
+
+    def _fetch():
+        client = finnhub.Client(api_key=FINNHUB_API_KEY)
+        today = datetime.today().strftime("%Y-%m-%d")
+        year_ago = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
+        return client.stock_insider_transactions(ticker.upper(), year_ago, today)
+
+    try:
+        data = await asyncio.to_thread(_fetch)
+    except Exception as e:
+        return f"Error fetching insider trades for {ticker}: {e}"
+
+    transactions = data.get("data", []) if isinstance(data, dict) else data
+    if not transactions:
+        return f"No insider transactions found for {ticker} in the past year."
+
+    lines = [
+        f"**Insider Trades — {ticker.upper()} (last 12 months)**\n",
+        f"{'Date':<14} {'Name':<24} {'Type':<8} {'Shares':>12} {'Price':>10} {'Value':>14}",
+        "-" * 86,
+    ]
+
+    total_buy_value = 0
+    total_sell_value = 0
+
+    for t in transactions[:20]:
+        name = (t.get("name") or "Unknown")[:23]
+        tx_type = t.get("transactionType", "")
+        shares = float(t.get("share", 0) or 0)
+        price = float(t.get("transactionPrice", 0) or 0)
+        value = abs(shares * price)
+        date_str = t.get("filingDate", "")[:10]
+
+        if "purchase" in tx_type.lower() or "buy" in tx_type.lower() or "acquisition" in tx_type.lower():
+            side = "BUY ✅"
+            total_buy_value += value
+        elif "sale" in tx_type.lower() or "sell" in tx_type.lower() or "disposition" in tx_type.lower():
+            side = "SELL"
+            total_sell_value += value
+        else:
+            side = tx_type[:7]
+
+        lines.append(
+            f"{date_str:<14} {name:<24} {side:<8} {shares:>12,.0f} {price:>10,.2f} {value:>14,.0f}"
+        )
+
+    lines.append("-" * 86)
+    lines.append(f"Total insider buying:  ${total_buy_value:>14,.0f}")
+    lines.append(f"Total insider selling: ${total_sell_value:>14,.0f}")
+
+    ratio = total_buy_value / total_sell_value if total_sell_value > 0 else float("inf")
+    if ratio > 2:
+        lines.append(f"\n✅ **STRONG INSIDER BUYING** — buy/sell ratio: {ratio:.1f}x")
+    elif ratio > 1:
+        lines.append(f"\n🟢 Net insider buying — ratio: {ratio:.1f}x")
+    elif ratio > 0.5:
+        lines.append(f"\n🟡 Mixed insider activity — ratio: {ratio:.1f}x")
+    else:
+        lines.append(f"\n🔴 Heavy insider selling — ratio: {ratio:.2f}x")
+
+    return "\n".join(lines)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Portfolio Allocation
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_portfolio_allocation() -> str:
+    """Analyse your portfolio allocation by sector, geography, and market cap.
+    Shows concentration metrics and diversification score.
+    Use this for portfolio health checks and rebalancing decisions."""
+
+    try:
+        positions = await t212.get_portfolio()
+    except Exception as e:
+        return f"Error fetching portfolio: {e}"
+
+    if not positions:
+        return "No open positions to analyse."
+
+    # Calculate position values
+    holdings = []
+    for p in positions:
+        ticker = _strip_t212_ticker(p["ticker"])
+        qty = float(p.get("quantity", 0) or 0)
+        price = float(p.get("currentPrice", 0) or 0)
+        value = qty * price
+        holdings.append({"ticker": ticker, "value": value})
+
+    total_value = sum(h["value"] for h in holdings) or 1
+
+    # Fetch sector/country/cap info for each position
+    async def _get_meta(ticker):
+        def _f():
+            return yf.Ticker(ticker).info
+        try:
+            info = await asyncio.to_thread(_f)
+            return {
+                "sector": info.get("sector", "Unknown"),
+                "country": info.get("country", "Unknown"),
+                "marketCap": float(info.get("marketCap", 0) or 0),
+                "name": info.get("shortName") or ticker,
+            }
+        except Exception:
+            return {"sector": "Unknown", "country": "Unknown", "marketCap": 0, "name": ticker}
+
+    metas = await asyncio.gather(*[_get_meta(h["ticker"]) for h in holdings])
+
+    # Merge
+    for h, m in zip(holdings, metas):
+        h.update(m)
+
+    lines = ["**Portfolio Allocation Analysis**\n"]
+
+    # --- Top holdings ---
+    holdings.sort(key=lambda x: x["value"], reverse=True)
+    lines.append("**Top Holdings**")
+    lines.append(f"{'#':<4} {'Ticker':<10} {'Name':<24} {'Value':>12} {'Weight':>8}")
+    lines.append("-" * 62)
+    for i, h in enumerate(holdings[:10], 1):
+        w = h["value"] / total_value * 100
+        lines.append(f"{i:<4} {h['ticker']:<10} {h['name'][:23]:<24} {h['value']:>12,.2f} {w:>7.1f}%")
+
+    # --- Sector allocation ---
+    sectors = {}
+    for h in holdings:
+        s = h.get("sector", "Unknown")
+        sectors[s] = sectors.get(s, 0) + h["value"]
+    sectors_sorted = sorted(sectors.items(), key=lambda x: x[1], reverse=True)
+
+    lines.append(f"\n**Sector Allocation**")
+    for sector, val in sectors_sorted:
+        w = val / total_value * 100
+        bar = "█" * int(w / 2)
+        lines.append(f"  {sector:<22} {w:>5.1f}%  {bar}")
+
+    # --- Geographic allocation ---
+    countries = {}
+    for h in holdings:
+        c = h.get("country", "Unknown")
+        countries[c] = countries.get(c, 0) + h["value"]
+    countries_sorted = sorted(countries.items(), key=lambda x: x[1], reverse=True)
+
+    lines.append(f"\n**Geographic Allocation**")
+    for country, val in countries_sorted:
+        w = val / total_value * 100
+        lines.append(f"  {country:<22} {w:>5.1f}%")
+
+    # --- Market cap allocation ---
+    cap_buckets = {"Mega (>$200B)": 0, "Large ($10-200B)": 0, "Mid ($2-10B)": 0, "Small (<$2B)": 0}
+    for h in holdings:
+        mc = h.get("marketCap", 0)
+        if mc >= 200e9:
+            cap_buckets["Mega (>$200B)"] += h["value"]
+        elif mc >= 10e9:
+            cap_buckets["Large ($10-200B)"] += h["value"]
+        elif mc >= 2e9:
+            cap_buckets["Mid ($2-10B)"] += h["value"]
+        else:
+            cap_buckets["Small (<$2B)"] += h["value"]
+
+    lines.append(f"\n**Market Cap Allocation**")
+    for bucket, val in cap_buckets.items():
+        w = val / total_value * 100
+        if w > 0:
+            lines.append(f"  {bucket:<22} {w:>5.1f}%")
+
+    # --- Concentration metrics ---
+    weights = [h["value"] / total_value for h in holdings]
+    hhi = sum(w ** 2 for w in weights)  # Herfindahl-Hirschman Index
+    top5_weight = sum(w for w in sorted(weights, reverse=True)[:5]) * 100
+
+    lines.append(f"\n**Concentration Metrics**")
+    lines.append(f"- Total positions: {len(holdings)}")
+    lines.append(f"- Top 5 weight: {top5_weight:.1f}%")
+    lines.append(f"- HHI (concentration): {hhi:.4f}  ({'concentrated' if hhi > 0.15 else 'moderate' if hhi > 0.08 else 'well diversified'})")
+    lines.append(f"- Effective positions: {1/hhi:.1f}  (HHI-equivalent equal-weight count)")
+
+    if top5_weight > 70:
+        lines.append(f"\n⚠️ **Heavy concentration** — top 5 positions are {top5_weight:.0f}% of portfolio")
+    if len(set(h.get("sector") for h in holdings)) <= 2:
+        lines.append(f"\n⚠️ **Sector concentration** — only {len(set(h.get('sector') for h in holdings))} sectors represented")
 
     return "\n".join(lines)
 
