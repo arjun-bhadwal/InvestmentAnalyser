@@ -11,3 +11,4 @@ scipy>=1.13.0
 fredapi>=0.5.2
 cachetools>=5.3.0
 pandas>=2.1.0
+polygon-api-client>=1.14.0
