@@ -34,9 +34,56 @@ def cached(cache: TTLCache):
 # Formatters
 # ---------------------------------------------------------------------------
 
+# T212 exchange code → yFinance suffix
+_T212_EXCHANGE_MAP: dict[str, str] = {
+    "US":  "",       # NYSE / NASDAQ — no suffix
+    "L":   ".L",     # London Stock Exchange
+    "DE":  ".DE",    # XETRA (Germany)
+    "AS":  ".AS",    # Euronext Amsterdam
+    "PA":  ".PA",    # Euronext Paris
+    "MI":  ".MI",    # Borsa Italiana (Milan)
+    "MC":  ".MC",    # Bolsa de Madrid
+    "SW":  ".SW",    # SIX Swiss Exchange
+    "TO":  ".TO",    # Toronto Stock Exchange
+    "HK":  ".HK",    # Hong Kong
+    "T":   ".T",     # Tokyo Stock Exchange
+    "AX":  ".AX",    # ASX (Australia)
+    "ST":  ".ST",    # Stockholm (Nasdaq Nordic)
+    "CO":  ".CO",    # Copenhagen
+    "HE":  ".HE",    # Helsinki
+    "OL":  ".OL",    # Oslo
+    "WA":  ".WA",    # Warsaw
+    "VI":  ".VI",    # Vienna
+    "BR":  ".SA",    # B3 (Brazil) — yFinance uses .SA
+    "SG":  ".SI",    # Singapore — yFinance uses .SI
+}
+
+
 def strip_t212_ticker(raw: str) -> str:
-    """Convert T212 instrument codes like 'AAPL_US_EQ' → 'AAPL'."""
-    return raw.split("_")[0]
+    """Convert T212 instrument codes to yFinance tickers.
+
+    Examples:
+        'AAPL_US_EQ'  → 'AAPL'
+        'VWRP_L_EQ'   → 'VWRP.L'
+        'BP_L_EQ'     → 'BP.L'
+        'SAP_DE_EQ'   → 'SAP.DE'
+        'RARE_L_EQ'   → 'RARE.L'
+    """
+    parts = raw.split("_")
+    symbol = parts[0]
+
+    # Look for an exchange code in the middle segments (skip first=symbol, last=EQ)
+    if len(parts) >= 3:
+        exchange = parts[-2]  # e.g. 'L', 'US', 'DE'
+        suffix = _T212_EXCHANGE_MAP.get(exchange, "")
+        return f"{symbol}{suffix}"
+
+    # Fallback: 2 parts like 'AAPL_EQ' — assume US
+    if len(parts) == 2 and parts[1] == "EQ":
+        return symbol
+
+    # Raw ticker with no underscore — return as-is
+    return raw
 
 
 def fmt_float(value, decimals: int = 2) -> str:
