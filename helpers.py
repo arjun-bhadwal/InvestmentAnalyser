@@ -215,6 +215,46 @@ def position_value(pos: dict) -> float:
     return total
 
 
+import asyncio
+import pandas as pd
+
+async def fetch_historic_prices(tickers: list[str], period: str = "1y", interval: str = "1d") -> pd.DataFrame:
+    """Fetch price histories via yfinance. If any ticker 404s, fall back to alternative global exchanges."""
+    import yfinance as yf
+    
+    unique_tickers = list(dict.fromkeys(tickers))
+    def _fetch(syms):
+        return yf.download(syms, period=period, interval=interval, auto_adjust=True, progress=False)
+        
+    data = await asyncio.to_thread(_fetch, unique_tickers)
+    
+    if data.empty:
+        closes = pd.DataFrame()
+    else:
+        closes = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data[["Close"]].rename(columns={"Close": unique_tickers[0]})
+        
+    # Drop entirely absent columns
+    closes = closes.dropna(axis=1, how="all")
+    missing = set(unique_tickers) - set(closes.columns)
+    
+    # Fallback Heuristic
+    for m in missing:
+        base = m.split(".")[0]
+        alts = [base, f"{base}.L", f"{base}.PA", f"{base}.MI", f"{base}.AS", f"{base}.F", f"{base}.DE"]
+        for alt in alts:
+            if alt == m: continue
+            alt_data = await asyncio.to_thread(_fetch, [alt])
+            if not alt_data.empty:
+                alt_closes = alt_data["Close"] if isinstance(alt_data.columns, pd.MultiIndex) else alt_data[["Close"]].rename(columns={"Close": alt})
+                alt_closes = alt_closes.dropna(axis=1, how="all")
+                if alt in alt_closes.columns and len(alt_closes[alt].dropna()) > 30:
+                    # Successful recovery! Inject back to the dataframe
+                    closes[m] = alt_closes[alt]
+                    break
+                    
+    return closes
+
+
 def fmt_billions(val) -> str:
     """Format large numbers as billions/millions."""
     import numpy as np

@@ -33,19 +33,16 @@ async def get_portfolio_risk() -> str:
 
     tickers = list(dict.fromkeys(strip_t212_ticker(p["ticker"]) for p in positions))  # unique, ordered
 
-    def _fetch():
-        return yf.download(tickers + ["SPY"], period="1y", interval="1d", auto_adjust=True, progress=False)
-
+    from helpers import fetch_historic_prices
+    
     try:
-        data = await asyncio.to_thread(_fetch)
+        closes = await fetch_historic_prices(tickers + ["SPY"], period="1y", interval="1d")
     except Exception as e:
         return f"Error fetching price history: {e}"
 
-    if data.empty:
+    if closes.empty:
         return "No price data returned. Check that ticker symbols are valid."
-
-    closes = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data[["Close"]].rename(columns={"Close": tickers[0]})
-    closes = closes.dropna(how="all")
+        
     # Identify and drop columns (tickers) that failed entirely
     closes = closes.dropna(axis=1, how="all")
     missing_tickers = set(tickers + ["SPY"]) - set(closes.columns)
@@ -239,19 +236,16 @@ async def get_portfolio_stress_test(simulations: int = 1000) -> str:
     weights = {k: v / total for k, v in weights_raw.items()}
 
     # Use max available history — try to go back as far as possible for scenarios
-    def _fetch():
-        return yf.download(tickers, period="max", interval="1d", auto_adjust=True, progress=False)
-
+    from helpers import fetch_historic_prices
+    
     try:
-        data = await asyncio.to_thread(_fetch)
+        closes = await fetch_historic_prices(tickers, period="max", interval="1d")
     except Exception as e:
         return f"Error: {e}"
 
-    if data.empty:
+    if closes.empty:
         return "No price data returned. Check that ticker symbols are valid."
-
-    closes = data["Close"].dropna(how="all") if isinstance(data.columns, pd.MultiIndex) else data[["Close"]].rename(columns={"Close": tickers[0]})
-    closes = closes.dropna(axis=1, how="all")
+        
     missing = set(tickers) - set(closes.columns)
     
     returns = closes.pct_change().dropna()
