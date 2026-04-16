@@ -15,6 +15,26 @@ cache_prices       = TTLCache(maxsize=64,  ttl=300)    # 5 min
 cache_macro        = TTLCache(maxsize=16,  ttl=3600)   # 1 hour
 
 
+def finnhub_retry(func):
+    """Synchronous backoff decorator for Finnhub API 429 rate limits."""
+    import time
+    from functools import wraps
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        for attempt in range(4):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                err_str = str(e).lower()
+                if "429" in err_str or "rate limit" in err_str or "too many requests" in err_str:
+                    if attempt == 3:
+                        raise RuntimeError(f"Finnhub rate limit exhausted after retries: {e}")
+                    time.sleep(1.0 + (1.5 ** attempt))  # 2.0s, 2.5s, 3.25s
+                else:
+                    raise e
+    return wrapper
+
+
 def cached(cache: TTLCache):
     """Decorator to cache async function results by args hash."""
     def decorator(fn):
@@ -68,40 +88,131 @@ def strip_t212_ticker(raw: str) -> str:
         'BP_L_EQ'     → 'BP.L'
         'SAP_DE_EQ'   → 'SAP.DE'
         'RARE_L_EQ'   → 'RARE.L'
+        'RAREl'       → 'RARE.L'
+        'EUDFd'       → 'EUDF.DE'
     """
     parts = raw.split("_")
     symbol = parts[0]
 
-    # Look for an exchange code in the middle segments (skip first=symbol, last=EQ)
+    # Middle exchange mapping (e.g. 'SAP_DE_EQ')
     if len(parts) >= 3:
-        exchange = parts[-2]  # e.g. 'L', 'US', 'DE'
+        exchange = parts[-2]
         suffix = _T212_EXCHANGE_MAP.get(exchange, "")
         return f"{symbol}{suffix}"
 
-    # Fallback: 2 parts like 'AAPL_EQ' — assume US
-    if len(parts) == 2 and parts[1] == "EQ":
-        return symbol
+    # If it reached here, we just have a target symbol (e.g., AAPL_EQ -> AAPL, RAREl_EQ -> RAREl).
+    # Handle compact T212 tickers where the last char is lowercase exchange (e.g., 'RAREl', 'EUDFd')
+    if len(symbol) > 1 and symbol[-1].islower() and symbol[:-1].isupper():
+        compact_map = {
+            'l': '.L',   'd': '.DE',  'a': '.AS',  'p': '.PA',
+            'm': '.MI',  'e': '.MC',  's': '.SW',  't': '.TO',
+            'h': '.HK',  'j': '.T',   'x': '.AX',  'c': '.CO',
+            'i': '.HE',  'o': '.OL',  'w': '.WA',  'v': '.VI',
+            'b': '.SA',  'g': '.SI',
+        }
+        suffix = compact_map.get(symbol[-1], "")
+        return f"{symbol[:-1]}{suffix}"
 
-    # Raw ticker with no underscore — return as-is
-    return raw
+    # US or Raw ticker with no recognizable exchange format
+    return symbol
 
 
-def fmt_float(value, decimals: int = 2) -> str:
+def safe_float(val, fallback=0.0) -> float:
+    """Safely convert strings, NaNs, and messy API values to a float."""
+    if val is None:
+        return fallback
+    if isinstance(val, (int, float)):
+        import math
+        return fallback if math.isnan(val) else float(val)
+        
+    val_str = str(val).strip()
+    if not val_str or val_str.lower() in ("nan", "none", "n/a", "null"):
+        return fallback
+        
+    # Strip everything except digits, comma, period, minus sign
+    res = []
+    for char in val_str:
+        if char.isdigit() or char in ",.-":
+            res.append(char)
+    val_str = "".join(res)
+    
+    if not val_str or val_str == "-":
+        return fallback
+
+    last_comma = val_str.rfind(',')
+    last_dot = val_str.rfind('.')
+    
+    if last_comma > -1 and last_dot > -1:
+        if last_comma > last_dot:
+            # European: 1.234,56
+            val_str = val_str.replace('.', '').replace(',', '.')
+        else:
+            # US: 1,234.56
+            val_str = val_str.replace(',', '')
+    elif last_comma > -1:
+        # Check if comma acts as decimal or thousands separator
+        # If exactly 3 digits follow the *last* comma, assume thousands (e.g., 123,456)
+        # Note: 12,345,678 will also have 3 digits following the last comma.
+        if len(val_str) - last_comma - 1 == 3:
+            val_str = val_str.replace(',', '')
+        else:
+            # Otherwise assume decimal (e.g., 12,50)
+            val_str = val_str.replace(',', '.')
+            
     try:
-        return f"{float(value):,.{decimals}f}"
-    except (TypeError, ValueError):
+        return float(val_str)
+    except Exception:
+        return fallback
+
+
+def fmt_float(val, decimals: int = 2) -> str:
+    """Format a messy value beautifully, returning 'N/A' if unparseable."""
+    if val is None or str(val).lower() in ("nan", "none", "n/a", ""):
+        return "N/A"
+    try:
+        f = safe_float(val, fallback=None)
+        if f is None:
+            return "N/A"
+        return f"{f:,.{decimals}f}"
+    except Exception:
         return "N/A"
 
 
 def position_value(pos: dict) -> float:
-    """Calculate position value, converting GBX (pence) → GBP when needed."""
-    qty = float(pos.get("quantity", 0) or 0)
-    price = float(pos.get("currentPrice", 0) or 0)
-    ccy = (pos.get("currencyCode") or pos.get("currency") or "").upper()
-    if ccy in ("GBX", "GBP"):  # GBX = pence, divide by 100
-        if ccy == "GBX":
-            price = price / 100
-    return qty * price
+    """Calculate absolute live position value securely in Account Base Currency.
+    Extracts the Live FX factor using the differential identity:
+    ppl - fxPpl = (currentPrice - averagePrice) * qty * Current_FX
+    """
+    qty = safe_float(pos.get("quantity"))
+    cur = safe_float(pos.get("currentPrice"))
+    avg = safe_float(pos.get("averagePrice"))
+    ppl = safe_float(pos.get("ppl"))
+    fx_ppl = safe_float(pos.get("fxPpl")) # often None
+    
+    if qty == 0 or cur == 0:
+        return 0.0
+        
+    pure_diff = (cur - avg) * qty
+    base_margin = ppl - fx_ppl
+    
+    # 1. Evaluate Live FX Conversion mathematically
+    if abs(pure_diff) > 0.005:
+        fx_conversion = base_margin / pure_diff
+        # Guard rails for math anomalies
+        if 0.0001 < fx_conversion < 5000:
+            return cur * qty * fx_conversion
+            
+    # 2. Hard Fallback if price hasn't moved (pure_diff == 0)
+    total = qty * cur
+    ccy = str(pos.get("currencyCode", "") or pos.get("currency", "")).upper()
+    if ccy in ("GBX",):
+        return total / 100
+        
+    # Empirical Pence fallback (LSE stocks usually trade > 500 pence)
+    if total > 50000 and cur > 1000 and abs(fx_ppl) < 0.2:
+        return total / 100
+
+    return total
 
 
 def fmt_billions(val) -> str:

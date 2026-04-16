@@ -22,40 +22,56 @@ class T212Client:
         )
         self.mode = mode
 
+    # ── Internal Retry ───────────────────────────────────────────────────────
+
+    async def _get_with_retry(self, path: str, params: dict = None) -> httpx.Response:
+        import asyncio
+        for attempt in range(4):
+            resp = await self._client.get(path, params=params)
+            if resp.status_code == 429:
+                if attempt == 3:
+                    self._raise_for_status(resp)
+                try:
+                    retry_after = int(resp.headers.get("Retry-After", "5"))
+                except ValueError:
+                    retry_after = 5
+                # Wait incrementally longer
+                wait_time = max(retry_after, 2 ** attempt)
+                await asyncio.sleep(wait_time)
+            else:
+                self._raise_for_status(resp)
+                return resp
+        return resp
+
     # ── Portfolio & Account ──────────────────────────────────────────────────
 
     async def get_portfolio(self) -> list[dict]:
         """GET /equity/portfolio — open positions."""
-        resp = await self._client.get("/equity/portfolio")
-        self._raise_for_status(resp)
+        resp = await self._get_with_retry("/equity/portfolio")
         return resp.json()
 
     async def get_account_summary(self) -> dict:
         """GET /equity/account/summary — account totals."""
-        resp = await self._client.get("/equity/account/summary")
-        self._raise_for_status(resp)
+        resp = await self._get_with_retry("/equity/account/summary")
         return resp.json()
 
     # ── History ──────────────────────────────────────────────────────────────
 
     async def get_order_history(self, limit: int = 50) -> list[dict]:
         """GET /equity/history/orders — recent order history."""
-        resp = await self._client.get("/equity/history/orders", params={"limit": limit})
-        self._raise_for_status(resp)
+        resp = await self._get_with_retry("/equity/history/orders", params={"limit": limit})
         data = resp.json()
         return data.get("items", data) if isinstance(data, dict) else data
 
     async def get_dividend_history(self, limit: int = 20) -> list[dict]:
         """GET /equity/history/dividends — dividend payments received."""
-        resp = await self._client.get("/equity/history/dividends", params={"limit": limit})
-        self._raise_for_status(resp)
+        resp = await self._get_with_retry("/equity/history/dividends", params={"limit": limit})
         data = resp.json()
         return data.get("items", data) if isinstance(data, dict) else data
 
     async def get_transaction_history(self, limit: int = 20) -> list[dict]:
         """GET /equity/history/transactions — cash transactions (deposits, withdrawals)."""
-        resp = await self._client.get("/equity/history/transactions", params={"limit": limit})
-        self._raise_for_status(resp)
+        resp = await self._get_with_retry("/equity/history/transactions", params={"limit": limit})
         data = resp.json()
         return data.get("items", data) if isinstance(data, dict) else data
 
@@ -63,8 +79,7 @@ class T212Client:
 
     async def get_open_orders(self) -> list[dict]:
         """GET /equity/orders — currently open/pending orders."""
-        resp = await self._client.get("/equity/orders")
-        self._raise_for_status(resp)
+        resp = await self._get_with_retry("/equity/orders")
         data = resp.json()
         return data.get("items", data) if isinstance(data, dict) else data
 
@@ -72,22 +87,19 @@ class T212Client:
 
     async def get_pies(self) -> list[dict]:
         """GET /equity/pies — all pies (automated portfolios)."""
-        resp = await self._client.get("/equity/pies")
-        self._raise_for_status(resp)
+        resp = await self._get_with_retry("/equity/pies")
         return resp.json()
 
     async def get_pie(self, pie_id: int) -> dict:
         """GET /equity/pies/{id} — detailed breakdown of a single pie."""
-        resp = await self._client.get(f"/equity/pies/{pie_id}")
-        self._raise_for_status(resp)
+        resp = await self._get_with_retry(f"/equity/pies/{pie_id}")
         return resp.json()
 
     # ── Metadata ─────────────────────────────────────────────────────────────
 
     async def find_instrument(self, query: str) -> dict | None:
         """Search instruments by shortName (ticker) or name. Returns first match."""
-        resp = await self._client.get("/equity/metadata/instruments")
-        self._raise_for_status(resp)
+        resp = await self._get_with_retry("/equity/metadata/instruments")
         instruments = resp.json()
         q = query.upper()
         for inst in instruments:
@@ -108,7 +120,11 @@ class T212Client:
         if resp.status_code == 401:
             raise PermissionError("T212 authentication failed — check T212_API_KEY")
         if resp.status_code == 429:
-            raise RuntimeError("T212 rate limit exceeded — try again in a moment")
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                raise RuntimeError(f"T212 rate limit exceeded — you MUST wait at least {retry_after} seconds before retrying.")
+            else:
+                raise RuntimeError("T212 rate limit exceeded — try again in a moment")
         if resp.status_code >= 500:
             raise RuntimeError(f"T212 API error ({resp.status_code}) — service may be unavailable")
         resp.raise_for_status()

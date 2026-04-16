@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import yfinance as yf
 
 import app
-from helpers import cached, cache_macro
+from helpers import cached, cache_macro, safe_float
 
 mcp = app.mcp
 
@@ -126,13 +126,13 @@ async def get_fear_greed_index() -> str:
 
     def _fetch():
         d = {}
-        try: d["vix"] = float(yf.Ticker("^VIX").fast_info.last_price)
+        try: d["vix"] = safe_float(yf.Ticker("^VIX").fast_info.last_price, fallback=None)
         except Exception: d["vix"] = None
 
         try:
             spy = yf.Ticker("SPY").history(period="6mo", interval="1d", auto_adjust=True)["Close"]
-            d["spy_price"] = float(spy.iloc[-1])
-            d["spy_ma125"] = float(spy.rolling(125).mean().iloc[-1])
+            d["spy_price"] = safe_float(spy.iloc[-1], fallback=None)
+            d["spy_ma125"] = safe_float(spy.rolling(125).mean().iloc[-1], fallback=None)
         except Exception:
             d["spy_price"] = d["spy_ma125"] = None
 
@@ -143,7 +143,7 @@ async def get_fear_greed_index() -> str:
                 h = yf.Ticker(sym).history(period="3mo", interval="1d", auto_adjust=True)["Close"]
                 if len(h) >= 50:
                     total += 1
-                    if float(h.iloc[-1]) > float(h.rolling(50).mean().iloc[-1]):
+                    if safe_float(h.iloc[-1]) > safe_float(h.rolling(50).mean().iloc[-1]):
                         above += 1
             except Exception: pass
         d["breadth_pct"] = (above / total * 100) if total > 0 else None
@@ -151,8 +151,14 @@ async def get_fear_greed_index() -> str:
         try:
             gold = yf.Ticker("GLD").history(period="1mo", interval="1d", auto_adjust=True)["Close"]
             spy_h = yf.Ticker("SPY").history(period="1mo", interval="1d", auto_adjust=True)["Close"]
-            d["safe_haven_diff"] = ((float(gold.iloc[-1]) - float(gold.iloc[0])) / float(gold.iloc[0]) * 100 -
-                                    (float(spy_h.iloc[-1]) - float(spy_h.iloc[0])) / float(spy_h.iloc[0]) * 100)
+            
+            g0, g1 = safe_float(gold.iloc[0]), safe_float(gold.iloc[-1])
+            s0, s1 = safe_float(spy_h.iloc[0]), safe_float(spy_h.iloc[-1])
+            
+            if g0 != 0 and s0 != 0:
+                d["safe_haven_diff"] = ((g1 - g0) / g0 * 100) - ((s1 - s0) / s0 * 100)
+            else:
+                d["safe_haven_diff"] = None
         except Exception:
             d["safe_haven_diff"] = None
         return d

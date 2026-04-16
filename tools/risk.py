@@ -46,6 +46,10 @@ async def get_portfolio_risk() -> str:
 
     closes = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data[["Close"]].rename(columns={"Close": tickers[0]})
     closes = closes.dropna(how="all")
+    # Identify and drop columns (tickers) that failed entirely
+    closes = closes.dropna(axis=1, how="all")
+    missing_tickers = set(tickers + ["SPY"]) - set(closes.columns)
+    
     if closes.empty:
         return "Insufficient price data after filtering."
 
@@ -64,7 +68,8 @@ async def get_portfolio_risk() -> str:
     available = [t for t in tickers if t in returns.columns and returns[t].dropna().shape[0] >= 30]
     missing = [t for t in tickers if t not in available]
     if missing:
-        lines.append(f"⚠️ Insufficient data for: {', '.join(missing)}\n")
+        lines.append(f"⚠️ Insufficient data for: {', '.join(missing)}")
+        lines.append(f"   (Identify if this ticker requires a different regional suffix or substitute the US ADR equivalent using the `find_instrument` tool or web search.)\n")
 
     if not available:
         return "No tickers had sufficient price history (need 30+ trading days)."
@@ -246,6 +251,9 @@ async def get_portfolio_stress_test(simulations: int = 1000) -> str:
         return "No price data returned. Check that ticker symbols are valid."
 
     closes = data["Close"].dropna(how="all") if isinstance(data.columns, pd.MultiIndex) else data[["Close"]].rename(columns={"Close": tickers[0]})
+    closes = closes.dropna(axis=1, how="all")
+    missing = set(tickers) - set(closes.columns)
+    
     returns = closes.pct_change().dropna()
 
     avail = [t for t in tickers if t in returns.columns and returns[t].dropna().shape[0] >= 30]
@@ -253,7 +261,8 @@ async def get_portfolio_stress_test(simulations: int = 1000) -> str:
 
     lines = ["**Portfolio Stress Test**\n"]
     if missing:
-        lines.append(f"⚠️ Insufficient data for: {', '.join(missing)}\n")
+        lines.append(f"⚠️ Insufficient data for: {', '.join(missing)}")
+        lines.append(f"   (Identify if this ticker requires a different regional suffix or substitute the US ADR equivalent using the `find_instrument` tool or web search.)\n")
 
     if not avail:
         return "No tickers had sufficient price history for stress testing."

@@ -594,6 +594,8 @@ async def get_realtime_quote(ticker: str) -> str:
     try:
         snap = await asyncio.to_thread(_fetch)
     except Exception as e:
+        if "Unknown API Key" in str(e) or "401" in str(e):
+            return f"❌ Polygon API Key Error: Your key depends on an invalid key. Please check .env."
         # Fallback to yfinance on error
         return await get_price(ticker)
 
@@ -672,6 +674,8 @@ async def get_market_status() -> str:
     try:
         status = await asyncio.to_thread(_fetch)
     except Exception as e:
+        if "Unknown API Key" in str(e) or "401" in str(e):
+            return f"❌ Polygon API Key Error: Your key is invalid. Please check .env."
         return f"Error fetching market status: {e}"
 
     if not status:

@@ -34,6 +34,25 @@ t212: T212Client
 @asynccontextmanager
 async def lifespan(server):
     global t212
+    import sys
+    print("\n" + "="*50, file=sys.stderr)
+    print("  Initializing Investment Analyser MCP", file=sys.stderr)
+    print("="*50, file=sys.stderr)
+    
+    keys = {
+        "T212": T212_API_KEY,
+        "FINNHUB": FINNHUB_API_KEY,
+        "FRED": FRED_API_KEY,
+        "POLYGON": POLYGON_API_KEY,
+        "PERPLEXITY": PERPLEXITY_API_KEY
+    }
+    for name, key in keys.items():
+        if key:
+            print(f"  [{name:<10}] ✅ Active", file=sys.stderr)
+        else:
+            print(f"  [{name:<10}] ⚠ MISSING — some features disabled", file=sys.stderr)
+    print("="*50 + "\n", file=sys.stderr)
+
     t212 = T212Client(api_key=T212_API_KEY, api_secret=T212_API_SECRET, mode=T212_MODE)
     yield
     await t212.aclose()

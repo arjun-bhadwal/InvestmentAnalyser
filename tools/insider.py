@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import finnhub
 
 import app
-from helpers import cached, cache_fundamentals
+from helpers import cached, cache_fundamentals, finnhub_retry
 
 mcp = app.mcp
 
@@ -17,6 +17,7 @@ async def get_insider_trades(ticker: str) -> str:
     Insider buying is one of the most reliable bullish signals.
     Use this to check whether company insiders are putting their own money in."""
 
+    @finnhub_retry
     def _fetch():
         client = finnhub.Client(api_key=app.FINNHUB_API_KEY)
         today = datetime.today().strftime("%Y-%m-%d")

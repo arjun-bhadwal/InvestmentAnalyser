@@ -8,7 +8,7 @@ import ta as ta_lib
 import yfinance as yf
 
 import app
-from helpers import cached, cache_prices, cache_fundamentals, strip_t212_ticker, fmt_float
+from helpers import cached, cache_prices, cache_fundamentals, strip_t212_ticker, fmt_float, safe_float
 
 mcp = app.mcp
 
@@ -64,7 +64,8 @@ async def get_technical_indicators(ticker: str) -> str:
 
     def _g(col):
         v = row.get(col)
-        return float(v) if v is not None and not np.isnan(float(v) if v is not None else float("nan")) else None
+        sf = safe_float(v, fallback=None)
+        return sf
 
     rsi    = _g("rsi")
     ma20   = _g("ma20")
@@ -384,17 +385,20 @@ async def screen_stocks(
         col = closes[sym].dropna()
         if len(col) < 60:
             continue
-        price = float(col.iloc[-1])
-        ma50  = float(col.rolling(50).mean().iloc[-1]) if len(col) >= 50 else None
-        ma200 = float(col.rolling(200).mean().iloc[-1]) if len(col) >= 200 else None
+        price = safe_float(col.iloc[-1])
+        ma50  = safe_float(col.rolling(50).mean().iloc[-1], fallback=None) if len(col) >= 50 else None
+        ma200 = safe_float(col.rolling(200).mean().iloc[-1], fallback=None) if len(col) >= 200 else None
 
         delta = col.diff()
         gain  = delta.clip(lower=0).rolling(14).mean()
         loss  = (-delta.clip(upper=0)).rolling(14).mean()
-        rs    = gain.iloc[-1] / loss.iloc[-1] if loss.iloc[-1] != 0 else 0
-        rsi   = 100 - (100 / (1 + rs)) if loss.iloc[-1] != 0 else 100
+        
+        last_gain = safe_float(gain.iloc[-1])
+        last_loss = safe_float(loss.iloc[-1])
+        rs    = last_gain / last_loss if last_loss != 0 else 0
+        rsi   = 100 - (100 / (1 + rs)) if last_loss != 0 else 100
 
-        mom_1m = (price - float(col.iloc[-22])) / float(col.iloc[-22]) * 100 if len(col) >= 22 else None
+        mom_1m = (price - safe_float(col.iloc[-22])) / safe_float(col.iloc[-22]) * 100 if len(col) >= 22 and safe_float(col.iloc[-22]) != 0 else None
 
         if rsi < min_rsi or rsi > max_rsi:
             continue

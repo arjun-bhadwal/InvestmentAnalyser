@@ -9,6 +9,7 @@ except ImportError:
     from duckduckgo_search import DDGS
 
 import app
+from helpers import finnhub_retry
 
 mcp = app.mcp
 
@@ -20,6 +21,7 @@ async def get_news(ticker: str) -> str:
     today = datetime.today().date()
     week_ago = today - timedelta(days=7)
 
+    @finnhub_retry
     def _fetch():
         client = finnhub.Client(api_key=app.FINNHUB_API_KEY)
         return client.company_news(ticker.upper(), _from=str(week_ago), to=str(today))
