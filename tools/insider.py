@@ -10,31 +10,40 @@ from helpers import cached, cache_fundamentals, finnhub_retry
 mcp = app.mcp
 
 
-@mcp.tool()
 @cached(cache_fundamentals)
-async def get_insider_trades(ticker: str) -> str:
+async def _get_insider_trades_core(ticker: str) -> str:
     """Return recent insider buy/sell activity for a stock via Finnhub.
-    Insider buying is one of the most reliable bullish signals.
-    Use this to check whether company insiders are putting their own money in."""
+    Insider buying is one of the most reliable bullish signals."""
+    from resolver import aresolve
+
+    # Resolve ticker to get correct Finnhub format
+    try:
+        rt = await aresolve(ticker)
+        base = rt.yf_symbol.split(".")[0]
+        finnhub_sym = f"LSE:{base}" if rt.exchange == "LSE" else base
+        display = rt.yf_symbol
+    except Exception:
+        finnhub_sym = ticker.upper().split(".")[0]
+        display = ticker.upper()
 
     @finnhub_retry
     def _fetch():
         client = finnhub.Client(api_key=app.FINNHUB_API_KEY)
         today = datetime.today().strftime("%Y-%m-%d")
         year_ago = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
-        return client.stock_insider_transactions(ticker.upper(), year_ago, today)
+        return client.stock_insider_transactions(finnhub_sym, year_ago, today)
 
     try:
         data = await asyncio.to_thread(_fetch)
     except Exception as e:
-        return f"Error fetching insider trades for {ticker}: {e}"
+        return f"Error fetching insider trades for {display}: {e}"
 
     transactions = data.get("data", []) if isinstance(data, dict) else data
     if not transactions:
-        return f"No insider transactions found for {ticker} in the past year."
+        return f"No insider transactions found for {display} in the past year."
 
     lines = [
-        f"**Insider Trades — {ticker.upper()} (last 12 months)**\n",
+        f"**Insider Trades — {display} (last 12 months)**\n",
         f"{'Date':<14} {'Name':<24} {'Type':<8} {'Shares':>12} {'Price':>10} {'Value':>14}",
         "-" * 86,
     ]

@@ -17,15 +17,17 @@ mcp = app.mcp
 # Technical Analysis
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def get_technical_indicators(ticker: str) -> str:
+async def _get_technical_indicators_core(ticker: str) -> str:
     """Return key technical indicators for a stock: RSI, MACD, Bollinger Bands, moving averages,
-    ATR, and a plain-English signal summary. Use this for entry/exit timing and trend confirmation."""
+    ATR, and a plain-English signal summary."""
 
-    def _fetch():
-        df = yf.Ticker(ticker).history(period="6mo", interval="1d", auto_adjust=True)
-        if df.empty:
+    from resolver import fetch_history
+    rt, raw_df = await fetch_history(ticker, period="6mo", interval="1d")
+
+    def _prep(df):
+        if df is None or df.empty:
             return None
+        df = df.copy()
         df.columns = [c.lower() for c in df.columns]
 
         close = df["close"]
@@ -51,12 +53,12 @@ async def get_technical_indicators(ticker: str) -> str:
         return df
 
     try:
-        df = await asyncio.to_thread(_fetch)
+        df = await asyncio.to_thread(_prep, raw_df)
     except Exception as e:
         return f"Error computing indicators for {ticker}: {e}"
 
     if df is None or df.empty:
-        return f"No data found for '{ticker}'."
+        return f"No data found for '{ticker}' (resolved to '{rt.yf_symbol}')."
 
     row = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else row
@@ -118,7 +120,7 @@ async def get_technical_indicators(ticker: str) -> str:
             signals.append(f"Price within Bollinger Bands ({bb_pct:.0f}% of range)")
 
     lines = [
-        f"**{ticker.upper()} — Technical Indicators**\n",
+        f"**{rt.yf_symbol} — Technical Indicators** ({rt.currency})\n",
         f"- Price:         {_fmt(price)}",
         "",
         f"**Moving Averages**",
@@ -163,9 +165,8 @@ SECTOR_ETFS = {
 }
 
 
-@mcp.tool()
 @cached(cache_prices)
-async def get_sector_rotation() -> str:
+async def _get_sector_rotation() -> str:
     """Return performance and momentum for all 11 S&P 500 sectors (SPDR ETFs) vs the S&P 500.
     Shows 1-day, 1-week, 1-month, 3-month, and 1-year returns plus relative strength vs SPY.
     Use this to identify where institutional money is flowing."""
@@ -322,8 +323,7 @@ _FTSE100_TICKERS = [
 ]
 
 
-@mcp.tool()
-async def screen_stocks(
+async def _screen_stocks_core(
     universe: str = "sp500",
     max_rsi: float = 40.0,
     min_rsi: float = 0.0,

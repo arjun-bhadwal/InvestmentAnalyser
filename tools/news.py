@@ -14,28 +14,55 @@ from helpers import finnhub_retry
 mcp = app.mcp
 
 
-@mcp.tool()
-async def get_news(ticker: str) -> str:
-    """Return the 5 most recent news headlines for a stock ticker via Finnhub.
-    Use standard tickers for US stocks (e.g. AAPL). For LSE stocks use EXCHANGE:TICKER (e.g. LSE:LLOY)."""
+async def _get_news_core(ticker: str, max_headlines: int = 5) -> str:
+    """Return recent news headlines for a stock ticker via Finnhub.
+    Resolves ticker format automatically (T212, LSE:SYM, bare, ISIN)."""
+    from resolver import aresolve
+
+    # Resolve to get exchange info for correct Finnhub format
+    try:
+        rt = await aresolve(ticker)
+        base = rt.yf_symbol.split(".")[0]
+        # Finnhub uses LSE:SYMBOL for London-listed stocks; bare symbol for US
+        finnhub_sym = f"LSE:{base}" if rt.exchange == "LSE" else base
+        display = rt.yf_symbol
+    except Exception:
+        finnhub_sym = ticker.upper().split(".")[0]
+        display = ticker.upper()
+
     today = datetime.today().date()
     week_ago = today - timedelta(days=7)
 
     @finnhub_retry
     def _fetch():
         client = finnhub.Client(api_key=app.FINNHUB_API_KEY)
-        return client.company_news(ticker.upper(), _from=str(week_ago), to=str(today))
+        return client.company_news(finnhub_sym, _from=str(week_ago), to=str(today))
 
     try:
         articles = await asyncio.to_thread(_fetch)
     except Exception as e:
-        return f"Error fetching news for {ticker}: {e}"
+        return f"Error fetching news for {display}: {e}"
 
     if not articles:
-        return f"No news found for '{ticker}' in the past 7 days."
+        # Finnhub may not have LSE coverage — fall back to bare symbol
+        if finnhub_sym != display and ":" in finnhub_sym:
+            try:
+                bare = finnhub_sym.split(":")[1]
 
-    lines = [f"**Recent news: {ticker.upper()}**\n"]
-    for article in articles[:5]:
+                @finnhub_retry
+                def _fetch_bare():
+                    client = finnhub.Client(api_key=app.FINNHUB_API_KEY)
+                    return client.company_news(bare, _from=str(week_ago), to=str(today))
+
+                articles = await asyncio.to_thread(_fetch_bare)
+            except Exception:
+                articles = []
+
+    if not articles:
+        return f"No news found for '{display}' in the past 7 days."
+
+    lines = [f"**Recent news: {display}**\n"]
+    for article in articles[:max_headlines]:
         headline = article.get("headline", "No headline")
         source = article.get("source", "")
         url = article.get("url", "")
@@ -91,11 +118,9 @@ async def search_web(query: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
-async def research(query: str) -> str:
-    """Deep research synthesis using Perplexity AI — returns a cited, multi-source answer.
-    Better than web search for earnings analysis, geopolitical context, sector deep-dives.
-    Requires PERPLEXITY_API_KEY in .env."""
+async def _research_perplexity(query: str) -> str:
+    """Deep research via Perplexity AI (requires PERPLEXITY_API_KEY in .env).
+    Not exposed — use search_web instead, which requires no API key."""
 
     if not app.PERPLEXITY_API_KEY:
         return "PERPLEXITY_API_KEY not set. Add it to .env. Get a key at https://www.perplexity.ai/settings/api"

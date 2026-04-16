@@ -17,8 +17,7 @@ mcp = app.mcp
 # Portfolio Risk Analytics
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def get_portfolio_risk() -> str:
+async def _get_portfolio_risk() -> str:
     """Run a comprehensive risk analysis on your portfolio: annualised return & volatility,
     Sharpe ratio, Sortino ratio, Value at Risk, max drawdown, beta to SPY, and a correlation matrix.
     Uses 1 year of daily price data."""
@@ -50,7 +49,8 @@ async def get_portfolio_risk() -> str:
     if closes.empty:
         return "Insufficient price data after filtering."
 
-    returns = closes.pct_change().dropna()
+    returns = closes.pct_change().iloc[1:]  # only strip first-row NaN from pct_change
+    returns = returns.replace([np.inf, -np.inf], np.nan)  # guard against div-by-zero spikes
     TRADING_DAYS = 252
 
     try:
@@ -216,8 +216,7 @@ async def calculate_position_size(
 # Portfolio Stress Test
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def get_portfolio_stress_test(simulations: int = 1000) -> str:
+async def _get_portfolio_stress_test(simulations: int = 1000) -> str:
     """Run stress tests: historical crisis scenarios and Monte Carlo simulation.
     simulations: number of Monte Carlo runs (default 1000).
     Returns drawdowns under 2008 crisis, COVID crash, 2022 rate hikes, and probability distribution."""
@@ -238,17 +237,25 @@ async def get_portfolio_stress_test(simulations: int = 1000) -> str:
     # Use max available history — try to go back as far as possible for scenarios
     from helpers import fetch_historic_prices
     
-    try:
-        closes = await fetch_historic_prices(tickers, period="max", interval="1d")
-    except Exception as e:
-        return f"Error: {e}"
+    
+    # Adaptive lookback: use longest period where at least 50% of the portfolio has sufficient data
+    chosen_period = "max"
+    for p in ("max", "10y", "5y", "2y", "1y", "6mo"):
+        closes = await fetch_historic_prices(tickers, period=p, interval="1d")
+        if not closes.empty:
+            avail = [t for t in tickers if t in closes.columns and closes[t].dropna().shape[0] >= 30]
+            if len(avail) >= max(1, len(tickers)//2):
+                chosen_period = p
+                break
+
 
     if closes.empty:
         return "No price data returned. Check that ticker symbols are valid."
         
     missing = set(tickers) - set(closes.columns)
     
-    returns = closes.pct_change().dropna()
+    returns = closes.pct_change().iloc[1:]  # only strip first-row NaN; don't nuke rows with partial data
+    returns = returns.replace([np.inf, -np.inf], np.nan)
 
     avail = [t for t in tickers if t in returns.columns and returns[t].dropna().shape[0] >= 30]
     missing = [t for t in tickers if t not in avail]
@@ -318,8 +325,7 @@ async def get_portfolio_stress_test(simulations: int = 1000) -> str:
 # Portfolio Allocation
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def get_portfolio_allocation() -> str:
+async def _get_portfolio_allocation() -> str:
     """Analyse portfolio allocation by sector, geography, and market cap.
     Shows concentration metrics and diversification score."""
 
@@ -396,3 +402,39 @@ async def get_portfolio_allocation() -> str:
         lines.append(f"\n⚠️ Top 5 = {top5:.0f}% — heavy concentration")
 
     return "\n".join(lines)
+
+
+# ===========================================================================
+# NEW CONSOLIDATED ANALYZE PORTFOLIO ENDPOINT
+# ===========================================================================
+
+@mcp.tool()
+async def analyze_portfolio(metrics: str = "risk,stress,allocation", simulations: int = 1000) -> str:
+    """Run full quantitative analysis on your actual portfolio.
+    metrics: comma-separated combination of 'risk' (vol, sharpe, beta), 'stress' (monte carlo), 'allocation' (weights)"""
+    
+    m_list = [m.strip().lower() for m in metrics.split(",")]
+    lines = []
+    
+    if "risk" in m_list:
+        res = await _get_portfolio_risk()
+        if "_[DEPRECATED" in res:
+            res = res.split("]_", 1)[-1].strip()
+        lines.append(res)
+        
+    if "allocation" in m_list:
+        if lines: lines.append("\n")
+        res = await _get_portfolio_allocation()
+        if "_[DEPRECATED" in res:
+            res = res.split("]_", 1)[-1].strip()
+        lines.append(res)
+        
+    if "stress" in m_list:
+        if lines: lines.append("\n")
+        res = await _get_portfolio_stress_test(simulations=simulations)
+        if "_[DEPRECATED" in res:
+            res = res.split("]_", 1)[-1].strip()
+        lines.append(res)
+        
+    return "\n".join(lines)
+
