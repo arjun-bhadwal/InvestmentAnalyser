@@ -28,92 +28,6 @@ def _polygon_client():
 # Prices
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def get_price(ticker: str) -> str:
-    """Return the current price and day change for a stock ticker (e.g. AAPL, TSLA, LLOY.L)."""
-    def _fetch():
-        info = yf.Ticker(ticker).fast_info
-        return info.last_price, info.previous_close
-
-    try:
-        last, prev = await asyncio.to_thread(_fetch)
-    except Exception as e:
-        return f"Error fetching price for {ticker}: {e}"
-
-    if last is None or prev is None:
-        return f"Could not retrieve price data for '{ticker}'. Check the ticker symbol."
-
-    change = last - prev
-    change_pct = (change / prev) * 100 if prev else 0
-    arrow = "▲" if change >= 0 else "▼"
-    sign = "+" if change >= 0 else ""
-
-    return (
-        f"**{ticker.upper()}**\n"
-        f"- Price:      {last:,.4f}\n"
-        f"- Day change: {arrow} {sign}{change:,.4f} ({sign}{change_pct:.2f}%)\n"
-        f"- Prev close: {prev:,.4f}"
-    )
-
-
-@mcp.tool()
-async def get_price_history(ticker: str, period: str = "1mo") -> str:
-    """Return OHLCV price history for a ticker.
-    period options: 1wk, 1mo, 3mo, 1y
-    Use this to analyse performance over time and identify trends."""
-
-    period_map = {"1wk": ("7d", "1d"), "1mo": ("1mo", "1d"), "3mo": ("3mo", "1wk"), "1y": ("1y", "1mo")}
-    if period not in period_map:
-        return f"Invalid period '{period}'. Use: 1wk, 1mo, 3mo, 1y"
-
-    yf_period, interval = period_map[period]
-
-    def _fetch():
-        return yf.Ticker(ticker).history(period=yf_period, interval=interval, auto_adjust=True)
-
-    try:
-        df = await asyncio.to_thread(_fetch)
-    except Exception as e:
-        return f"Error fetching history for {ticker}: {e}"
-
-    if df.empty:
-        return f"No historical data found for '{ticker}'."
-
-    first_close = float(df["Close"].iloc[0])
-    last_close = float(df["Close"].iloc[-1])
-    total_change = last_close - first_close
-    total_pct = (total_change / first_close) * 100 if first_close else 0
-    high = float(df["High"].max())
-    low = float(df["Low"].min())
-    avg_vol = int(df["Volume"].mean()) if "Volume" in df else 0
-
-    lines = [
-        f"**{ticker.upper()} — Price History ({period})**\n",
-        f"- Period return: {'+' if total_pct >= 0 else ''}{total_pct:.2f}% "
-        f"({'+' if total_change >= 0 else ''}{total_change:,.4f})",
-        f"- Period high:   {high:,.4f}",
-        f"- Period low:    {low:,.4f}",
-        f"- Avg volume:    {avg_vol:,}",
-        "",
-        f"{'Date':<14} {'Open':>10} {'High':>10} {'Low':>10} {'Close':>10} {'Chg%':>7}",
-        "-" * 65,
-    ]
-
-    prev_close = None
-    for date, row in df.iterrows():
-        date_str = date.strftime("%d %b %Y") if hasattr(date, "strftime") else str(date)[:10]
-        close = float(row["Close"])
-        chg_str = ""
-        if prev_close:
-            chg = (close - prev_close) / prev_close * 100
-            chg_str = f"{'+' if chg >= 0 else ''}{chg:.2f}%"
-        lines.append(
-            f"{date_str:<14} {float(row['Open']):>10,.2f} {float(row['High']):>10,.2f} "
-            f"{float(row['Low']):>10,.2f} {close:>10,.2f} {chg_str:>7}"
-        )
-        prev_close = close
-
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -134,9 +48,8 @@ def _div_yield(info: dict) -> str:
     return f"{pct:.2f}%"
 
 
-@mcp.tool()
 @cached(cache_fundamentals)
-async def get_stock_fundamentals(ticker: str) -> str:
+async def _get_stock_fundamentals(ticker: str) -> str:
     """Return key fundamental data for a stock: P/E, EPS, market cap, revenue, margins, 52w range, beta, dividend.
     Use this for fundamental analysis and valuation."""
 
@@ -198,9 +111,8 @@ async def get_stock_fundamentals(ticker: str) -> str:
     )
 
 
-@mcp.tool()
 @cached(cache_fundamentals)
-async def get_analyst_ratings(ticker: str) -> str:
+async def _get_analyst_ratings(ticker: str) -> str:
     """Return analyst consensus ratings, price targets, and recommendation trends for a stock.
     Use this to understand what professional analysts think."""
 
@@ -322,9 +234,8 @@ async def get_market_snapshot() -> str:
 # Financial Statements
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
 @cached(cache_fundamentals)
-async def get_financial_statements(ticker: str) -> str:
+async def _get_financial_statements(ticker: str) -> str:
     """Return income statement, balance sheet, and cash flow highlights for a stock.
     Shows last 4 annual periods with key ratios: ROE, ROA, current ratio, D/E, FCF yield.
     Use this for deep fundamental analysis beyond the basics."""
@@ -414,9 +325,8 @@ async def get_financial_statements(ticker: str) -> str:
 # DCF Valuation
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
 @cached(cache_fundamentals)
-async def get_dcf_valuation(ticker: str, growth_rate_pct: float = 0.0, discount_rate_pct: float = 10.0) -> str:
+async def _get_dcf_valuation(ticker: str, growth_rate_pct: float = 0.0, discount_rate_pct: float = 10.0) -> str:
     """Estimate intrinsic value using a Discounted Cash Flow (DCF) model.
     growth_rate_pct: override FCF growth rate (0 = auto-detect from analyst estimates)
     discount_rate_pct: discount rate / WACC (default 10%)
@@ -514,9 +424,8 @@ async def get_dcf_valuation(ticker: str, growth_rate_pct: float = 0.0, discount_
 # Peer Comparison
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
 @cached(cache_fundamentals)
-async def compare_peers(tickers: str) -> str:
+async def _compare_peers(tickers: str) -> str:
     """Compare 2-6 stocks side-by-side on fundamentals, technicals, and analyst views.
     tickers: comma-separated list, e.g. 'AAPL,MSFT,GOOGL'"""
 
@@ -576,68 +485,6 @@ async def compare_peers(tickers: str) -> str:
 # ---------------------------------------------------------------------------
 # Polygon.io — Real-time Quote & Market Status
 # ---------------------------------------------------------------------------
-
-@mcp.tool()
-async def get_realtime_quote(ticker: str) -> str:
-    """Return a real-time snapshot quote for a stock via Polygon.io.
-    Faster and more accurate than yfinance for intraday data.
-    Includes last trade, bid/ask spread, and today's OHLCV."""
-
-    client = _polygon_client()
-    if not client:
-        return await get_price(ticker)  # fallback to yfinance
-
-    def _fetch():
-        snapshot = client.get_snapshot_ticker("stocks", ticker.upper())
-        return snapshot
-
-    try:
-        snap = await asyncio.to_thread(_fetch)
-    except Exception as e:
-        if "Unknown API Key" in str(e) or "401" in str(e):
-            return f"❌ Polygon API Key Error: Your key depends on an invalid key. Please check .env."
-        # Fallback to yfinance on error
-        return await get_price(ticker)
-
-    if not snap:
-        return await get_price(ticker)
-
-    try:
-        day = snap.day
-        prev = snap.prev_day
-        last = snap.last_trade
-
-        price = float(last.price) if last else float(day.close) if day else 0
-        prev_close = float(prev.close) if prev else 0
-        change = price - prev_close if prev_close else 0
-        change_pct = (change / prev_close * 100) if prev_close else 0
-        arrow = "▲" if change >= 0 else "▼"
-        sign = "+" if change >= 0 else ""
-
-        lines = [
-            f"**{ticker.upper()} — Real-time (Polygon.io)**\n",
-            f"- Last price:    {price:,.4f}",
-            f"- Day change:    {arrow} {sign}{change:,.4f} ({sign}{change_pct:.2f}%)",
-            f"- Prev close:    {prev_close:,.4f}",
-        ]
-
-        if day:
-            lines += [
-                "",
-                f"**Today's Session**",
-                f"- Open:    {float(day.open):,.4f}",
-                f"- High:    {float(day.high):,.4f}",
-                f"- Low:     {float(day.low):,.4f}",
-                f"- Volume:  {int(day.volume):,}" if day.volume else "",
-                f"- VWAP:    {float(day.vwap):,.4f}" if day.vwap else "",
-            ]
-
-        if last:
-            lines.append(f"\n- Last trade size: {int(last.size):,}" if last.size else "")
-
-        return "\n".join(l for l in lines if l)
-    except Exception:
-        return await get_price(ticker)
 
 
 @mcp.tool()
@@ -715,3 +562,92 @@ async def get_market_status() -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"Error parsing market status: {e}"
+
+
+# ===========================================================================
+# NEW BATCH-CAPABLE API ENDPOINTS
+# ===========================================================================
+
+async def get_prices(tickers: str, period: str = "current") -> str:
+    """Return prices and historical data for one or multiple tickers.
+    tickers: comma-separated list of symbols (e.g., 'AAPL, GOOG.O, LSE:COPX')
+    period: 'current' (latest quote), '1wk', '1mo', '3mo', '1y'"""
+    
+    from resolver import bulk_resolve, fetch_fast_price
+    from helpers import fetch_historic_prices
+    
+    syms = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if not syms:
+        return "Please provide at least one ticker."
+        
+    lines = []
+    if period == "current":
+        lines.append(f"**Current Prices ({len(syms)} assets)**\n")
+        
+        async def _get(s):
+            rt, last, prev = await fetch_fast_price(s)
+            return s, rt, last, prev
+            
+        results = await asyncio.gather(*[_get(s) for s in syms])
+        
+        for s, rt, last, prev in results:
+            if last is None:
+                lines.append(f"- **{s}**: Data unavailable.")
+                continue
+            
+            change = last - (prev or last)
+            change_pct = (change / prev) * 100 if prev else 0
+            arrow = "▲" if change >= 0 else "▼"
+            sign = "+" if change >= 0 else ""
+            lines.append(f"- **{rt.yf_symbol}** ({rt.currency}): {last:,.4f} | Day change: {arrow} {sign}{change:,.4f} ({sign}{change_pct:.2f}%)")
+        
+        return "\n".join(lines)
+        
+    else:
+        # History batching
+        df = await fetch_historic_prices(syms, period=period)
+        if df.empty:
+            return f"No historical data found for '{tickers}'."
+            
+        lines.append(f"**Historical Prices ({period})**\n")
+        # For multi-asset, compute period return summary
+        first_row = df.iloc[0]
+        last_row = df.iloc[-1]
+        
+        lines.append(f"{'Ticker':<12} {'Return':>10} {'Start':>12} {'Current':>12}")
+        lines.append("-" * 50)
+        
+        for col in df.columns:
+            import pandas as pd
+            start_price = first_row[col]
+            end_price = last_row[col]
+            if pd.isna(start_price) or pd.isna(end_price):
+                continue
+            ret = (end_price - start_price) / start_price * 100
+            sign = "+" if ret >= 0 else ""
+            lines.append(f"{col:<12} {sign}{ret:>9.2f}% {start_price:>12,.2f} {end_price:>12,.2f}")
+            
+        return "\n".join(lines)
+
+@mcp.tool()
+async def get_fundamentals(tickers: str, section: str = "overview") -> str:
+    """Return fundamental data for one or multiple tickers.
+    tickers: comma-separated list of symbols (e.g. 'AAPL, GOOG').
+    section: 'overview' (default), 'ratings', 'statements', 'dcf', 'peers'"""
+    
+    # For peer comparison, route back to the legacy comparative engine natively
+    if section == "peers" or len(tickers.split(",")) > 1:
+        # Route multi-ticker to peer logic
+        return await _compare_peers(tickers)
+        
+    # For single ticker routing:
+    t = tickers.split(",")[0].strip()
+    if section == "ratings":
+        return await _get_analyst_ratings(t)
+    elif section == "statements":
+        return await _get_financial_statements(t)
+    elif section == "dcf":
+        return await _get_dcf_valuation(t)
+    else:
+        return await _get_stock_fundamentals(t)
+

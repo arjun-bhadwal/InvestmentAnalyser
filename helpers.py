@@ -188,27 +188,36 @@ def position_value(pos: dict) -> float:
     avg = safe_float(pos.get("averagePrice"))
     ppl = safe_float(pos.get("ppl"))
     fx_ppl = safe_float(pos.get("fxPpl")) # often None
-    
+
     if qty == 0 or cur == 0:
         return 0.0
-        
+
     pure_diff = (cur - avg) * qty
     base_margin = ppl - fx_ppl
-    
+
     # 1. Evaluate Live FX Conversion mathematically
     if abs(pure_diff) > 0.005:
         fx_conversion = base_margin / pure_diff
         # Guard rails for math anomalies
         if 0.0001 < fx_conversion < 5000:
             return cur * qty * fx_conversion
-            
+
     # 2. Hard Fallback if price hasn't moved (pure_diff == 0)
     total = qty * cur
     ccy = str(pos.get("currencyCode", "") or pos.get("currency", "")).upper()
     if ccy in ("GBX",):
         return total / 100
-        
-    # Empirical Pence fallback (LSE stocks usually trade > 500 pence)
+
+    # 3. Resolver-based GBX detection (handles Yahoo mislabelling, e.g. SGLN.L)
+    try:
+        from resolver import resolve
+        rt = resolve(pos.get("ticker", ""), probe=False)
+        if rt.unit_scale != 1.0:
+            return total * rt.unit_scale
+    except Exception:
+        pass
+
+    # 4. Legacy empirical fallback (safety net for unseeded LSE tickers)
     if total > 50000 and cur > 1000 and abs(fx_ppl) < 0.2:
         return total / 100
 
@@ -219,51 +228,27 @@ import asyncio
 import pandas as pd
 
 async def fetch_historic_prices(tickers: list[str], period: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    """Fetch price histories via yfinance. If any ticker 404s, fall back to alternative global exchanges."""
-    import yfinance as yf
+    """Fetch price histories via resolver, applying unit scale and fallback resolution.
+    Returns DataFrame columns keyed by the *original* ticker strings provided."""
+    from resolver import fetch_historic_prices_scaled
     
     unique_tickers = list(dict.fromkeys(tickers))
-    def _fetch(syms):
-        return yf.download(syms, period=period, interval=interval, auto_adjust=True, progress=False)
-        
-    data = await asyncio.to_thread(_fetch, unique_tickers)
+    resolutions, closes = await fetch_historic_prices_scaled(unique_tickers, period=period, interval=interval)
     
-    if data.empty:
-        closes = pd.DataFrame()
-    else:
-        closes = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data[["Close"]].rename(columns={"Close": unique_tickers[0]})
+    if closes.empty:
+        return pd.DataFrame()
         
-    # Drop entirely absent columns
-    closes = closes.dropna(axis=1, how="all")
-    missing = set(unique_tickers) - set(closes.columns)
-    
-    # Fallback Heuristic
-    if missing:
-        import os, sys, contextlib
-        def _silent_fetch(syms):
-            with open(os.devnull, "w") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
-                return _fetch(syms)
-                
-        for m in missing:
-            base = m.split(".")[0]
-            alts = [base, f"{base}.L", f"{base}.PA", f"{base}.MI", f"{base}.AS", f"{base}.F", f"{base}.DE"]
-            recovered = False
-            for alt in alts:
-                if alt == m: continue
-                alt_data = await asyncio.to_thread(_silent_fetch, [alt])
-                if not alt_data.empty:
-                    alt_closes = alt_data["Close"] if isinstance(alt_data.columns, pd.MultiIndex) else alt_data[["Close"]].rename(columns={"Close": alt})
-                    alt_closes = alt_closes.dropna(axis=1, how="all")
-                    if alt in alt_closes.columns and len(alt_closes[alt].dropna()) > 30:
-                        # Successful recovery! Inject back to the dataframe
-                        closes[m] = alt_closes[alt]
-                        print(f"⚠️ {m} failed but was gracefully recovered using {alt} prices.")
-                        recovered = True
-                        break
-            if not recovered:
-                print(f"❌ {m} failed entirely across all global market fallbacks.")
-                    
-    return closes
+    # Re-map the resolved yf_symbols back to the caller's raw input strings
+    # We must construct a completely new DataFrame to handle cases where 
+    # multiple inputs map to the same resolved ticker.
+    result = pd.DataFrame(index=closes.index)
+    for raw in unique_tickers:
+        rt = resolutions.get(raw)
+        if rt and rt.yf_symbol in closes.columns:
+            result[raw] = closes[rt.yf_symbol]
+            
+    # Drop rows where everything is NaN for cleaner output, handling edge-cases
+    return result.dropna(axis=0, how="all")
 
 
 def fmt_billions(val) -> str:

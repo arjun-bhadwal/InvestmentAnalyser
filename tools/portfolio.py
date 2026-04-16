@@ -71,9 +71,8 @@ async def get_account_summary() -> str:
     )
 
 
-@mcp.tool()
-async def get_trade_history(limit: int = 20) -> str:
-    """Return your recent Trading 212 order/trade history (buys and sells)."""
+async def _get_trade_history(limit: int = 20) -> str:
+    """Return your recent Trading 212 order/trade history."""
     try:
         orders = await _t212().get_order_history(limit=limit)
     except Exception as e:
@@ -124,12 +123,11 @@ async def get_trade_history(limit: int = 20) -> str:
 # History — Dividends & Transactions
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def get_dividend_history(limit: int = 20) -> str:
+async def _get_dividend_history(limit: int = 20) -> str:
     """Return dividend payments received in your Trading 212 account.
     Use this to track income from dividend-paying stocks."""
     try:
-        dividends = await _t212().get_dividend_history(limit=limit)
+        dividends = await _t212()._get_dividend_history(limit=limit)
     except Exception as e:
         return f"Error fetching dividend history: {e}"
 
@@ -163,11 +161,10 @@ async def get_dividend_history(limit: int = 20) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
-async def get_transaction_history(limit: int = 20) -> str:
+async def _get_transaction_history(limit: int = 20) -> str:
     """Return cash transaction history: deposits and withdrawals on your Trading 212 account."""
     try:
-        transactions = await _t212().get_transaction_history(limit=limit)
+        transactions = await _t212()._get_transaction_history(limit=limit)
     except Exception as e:
         return f"Error fetching transaction history: {e}"
 
@@ -276,3 +273,38 @@ async def get_pies() -> str:
         )
 
     return "\n".join(lines)
+
+
+# ===========================================================================
+# NEW CONSOLIDATED ACCOUNT HISTORY ENDPOINT
+# ===========================================================================
+
+@mcp.tool()
+async def get_account_history(report_type: str = "all", limit: int = 20) -> str:
+    """Return historical account activity.
+    report_type: 'all' (default), 'trades' (orders), 'dividends', 'transactions' (cash)"""
+    
+    lines = []
+    
+    if report_type in ("all", "trades"):
+        res = await _get_trade_history(limit=limit)
+        if "_[DEPRECATED" in res:
+            res = res.split("]_", 1)[-1].strip()
+        lines.append(res)
+        
+    if report_type in ("all", "dividends"):
+        if lines: lines.append("\n")
+        res = await _get_dividend_history(limit=limit)
+        if "_[DEPRECATED" in res:
+            res = res.split("]_", 1)[-1].strip()
+        lines.append(res)
+        
+    if report_type in ("all", "transactions"):
+        if lines: lines.append("\n")
+        res = await _get_transaction_history(limit=limit)
+        if "_[DEPRECATED" in res:
+            res = res.split("]_", 1)[-1].strip()
+        lines.append(res)
+        
+    return "\n".join(lines)
+
