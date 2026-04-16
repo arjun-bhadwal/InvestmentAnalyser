@@ -181,9 +181,8 @@ async def _get_analyst_ratings(ticker: str) -> str:
 # Market Snapshot
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
 @cached(cache_prices)
-async def get_market_snapshot() -> str:
+async def _get_market_snapshot() -> str:
     """Return today's price moves for FTSE 100, S&P 500, and NASDAQ Composite."""
     indices = {
         "FTSE 100": "^FTSE",
@@ -568,7 +567,7 @@ async def get_market_status() -> str:
 # NEW BATCH-CAPABLE API ENDPOINTS
 # ===========================================================================
 
-async def get_prices(tickers: str, period: str = "current") -> str:
+async def _get_prices_core(tickers: str, period: str = "current") -> str:
     """Return prices and historical data for one or multiple tickers.
     tickers: comma-separated list of symbols (e.g., 'AAPL, GOOG.O, LSE:COPX')
     period: 'current' (latest quote), '1wk', '1mo', '3mo', '1y'"""

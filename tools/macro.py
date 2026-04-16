@@ -10,9 +10,8 @@ from helpers import cached, cache_macro, safe_float
 mcp = app.mcp
 
 
-@mcp.tool()
 @cached(cache_macro)
-async def get_macro_dashboard() -> str:
+async def _get_macro_dashboard() -> str:
     """Return key macroeconomic indicators: interest rates, yield curve, inflation,
     GDP growth, unemployment, VIX fear index, and USD strength.
     Use this for macro context before making investment decisions."""
@@ -118,9 +117,8 @@ async def get_macro_dashboard() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
 @cached(cache_macro)
-async def get_fear_greed_index() -> str:
+async def _get_fear_greed_index() -> str:
     """Return a composite Fear & Greed score (0-100) based on VIX, momentum,
     market breadth, and safe haven demand. 0=Extreme Fear, 100=Extreme Greed."""
 
@@ -215,3 +213,51 @@ async def get_fear_greed_index() -> str:
         "- 55-75: Greed — momentum favours bulls",
         "- 75-100: Extreme Greed — caution, potential top",
     ])
+
+
+# ===========================================================================
+# CONSOLIDATED MACRO BUNDLE
+# ===========================================================================
+
+@mcp.tool()
+async def get_macro_summary(include: str = "snapshot,macro,fear_greed,sectors") -> str:
+    """Return a composite macro view in one call — market indices, economic indicators,
+    fear/greed score, and sector rotation.
+    include: comma-separated subset of 'snapshot', 'macro', 'fear_greed', 'sectors'"""
+
+    from tools.market_data import _get_market_snapshot
+    from tools.analysis import _get_sector_rotation
+
+    parts = [p.strip().lower() for p in include.split(",")]
+
+    # Build tasks for the requested sections (all run concurrently)
+    task_keys, task_coros = [], []
+    if "snapshot" in parts:
+        task_keys.append("snapshot")
+        task_coros.append(_get_market_snapshot())
+    if "macro" in parts:
+        task_keys.append("macro")
+        task_coros.append(_get_macro_dashboard())
+    if "fear_greed" in parts:
+        task_keys.append("fear_greed")
+        task_coros.append(_get_fear_greed_index())
+    if "sectors" in parts:
+        task_keys.append("sectors")
+        task_coros.append(_get_sector_rotation())
+
+    if not task_coros:
+        return "No valid sections specified. Choose from: snapshot, macro, fear_greed, sectors"
+
+    results = await asyncio.gather(*task_coros, return_exceptions=True)
+
+    ordered = ["snapshot", "macro", "fear_greed", "sectors"]
+    section_map = {k: r for k, r in zip(task_keys, results)}
+
+    out_parts = []
+    for key in ordered:
+        if key not in section_map:
+            continue
+        val = section_map[key]
+        out_parts.append(str(val) if isinstance(val, Exception) else val)
+
+    return "\n\n---\n\n".join(out_parts)

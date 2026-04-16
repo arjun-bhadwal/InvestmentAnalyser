@@ -16,8 +16,7 @@ def _t212():
 # Portfolio & Account
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def get_portfolio() -> str:
+async def _get_portfolio_core() -> str:
     """Return all open positions from your Trading 212 account with quantity, average price, current price, and P&L."""
     try:
         positions = await _t212().get_portfolio()
@@ -47,8 +46,7 @@ async def get_portfolio() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
-async def get_account_summary() -> str:
+async def _get_account_summary_core() -> str:
     """Return a summary of your Trading 212 account: total value, free cash, and total invested."""
     try:
         data = await _t212().get_account_summary()
