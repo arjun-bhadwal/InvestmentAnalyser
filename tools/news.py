@@ -15,11 +15,15 @@ mcp = app.mcp
 
 
 async def _get_news_core(ticker: str, max_headlines: int = 5) -> str:
-    """Return recent news headlines for a stock ticker via Finnhub.
-    Resolves ticker format automatically (T212, LSE:SYM, bare, ISIN)."""
+    """Return recent news headlines for a stock ticker.
+
+    Tries Finnhub first (good for US equities). On empty results — including
+    LSE-listed names and ETFs where Finnhub coverage is thin or absent — falls
+    back to a web search using the fully-qualified yf_symbol (e.g. 'RARE.L')
+    so the query can never cross-contaminate with a same-name US ticker.
+    """
     from resolver import aresolve
 
-    # Resolve to get exchange info for correct Finnhub format
     try:
         rt = await aresolve(ticker)
         base = rt.yf_symbol.split(".")[0]
@@ -41,36 +45,29 @@ async def _get_news_core(ticker: str, max_headlines: int = 5) -> str:
     try:
         articles = await asyncio.to_thread(_fetch)
     except Exception as e:
-        return f"Error fetching news for {display}: {e}"
+        articles = []
 
-    if not articles:
-        # Finnhub may not have LSE coverage — fall back to bare symbol
-        if finnhub_sym != display and ":" in finnhub_sym:
-            try:
-                bare = finnhub_sym.split(":")[1]
+    if articles:
+        lines = [f"**Recent news: {display}** _(via Finnhub)_\n"]
+        for article in articles[:max_headlines]:
+            headline = article.get("headline", "No headline")
+            source = article.get("source", "")
+            url = article.get("url", "")
+            ts = article.get("datetime", 0)
+            date_str = datetime.fromtimestamp(ts).strftime("%d %b %Y") if ts else ""
+            lines.append(f"- [{headline}]({url}) — {source} ({date_str})")
+        return "\n".join(lines)
 
-                @finnhub_retry
-                def _fetch_bare():
-                    client = finnhub.Client(api_key=app.FINNHUB_API_KEY)
-                    return client.company_news(bare, _from=str(week_ago), to=str(today))
-
-                articles = await asyncio.to_thread(_fetch_bare)
-            except Exception:
-                articles = []
-
-    if not articles:
-        return f"No news found for '{display}' in the past 7 days."
-
-    lines = [f"**Recent news: {display}**\n"]
-    for article in articles[:max_headlines]:
-        headline = article.get("headline", "No headline")
-        source = article.get("source", "")
-        url = article.get("url", "")
-        ts = article.get("datetime", 0)
-        date_str = datetime.fromtimestamp(ts).strftime("%d %b %Y") if ts else ""
-        lines.append(f"- [{headline}]({url}) — {source} ({date_str})")
-
-    return "\n".join(lines)
+    # Finnhub returned nothing — don't fall back to a bare symbol (risk of wrong
+    # instrument, e.g. LSE:RARE → bare RARE → Ultragenyx biotech). Use web search
+    # with the fully-qualified symbol so the query is unambiguous.
+    try:
+        exchange_hint = f" {rt.exchange}" if rt.exchange else ""
+    except NameError:
+        exchange_hint = ""
+    web_query = f"{display}{exchange_hint} news {today.year}"
+    web_result = await search_web(web_query)
+    return f"⚠️ Finnhub: no coverage for '{finnhub_sym}' — using web search instead.\n\n{web_result}"
 
 
 @mcp.tool()

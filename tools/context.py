@@ -131,7 +131,9 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
         ccy = rt.currency if rt else "?"
 
         wgt = weights.get(raw, 0) * 100
-        cur_price = safe_float(pos.get("currentPrice"))
+        unit_scale = rt.unit_scale if rt else 1.0
+        cur_price_raw = safe_float(pos.get("currentPrice"))
+        cur_price = cur_price_raw * unit_scale if cur_price_raw is not None else None
         ppl = safe_float(pos.get("ppl"))
 
         # Period return from the single downloaded frame
