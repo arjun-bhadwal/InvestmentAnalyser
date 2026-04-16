@@ -3,7 +3,10 @@ import asyncio
 from datetime import datetime, timedelta
 
 import finnhub
-from duckduckgo_search import DDGS
+try:
+    from ddgs import DDGS  # renamed package (v7+)
+except ImportError:
+    from duckduckgo_search import DDGS
 
 import app
 
@@ -47,16 +50,35 @@ async def search_web(query: str) -> str:
     Examples: 'TSLA latest news', 'oil price geopolitical risk 2025'"""
 
     def _fetch():
-        with DDGS() as ddgs:
-            return list(ddgs.text(query, max_results=8))
+        # Retry up to 3 times — DuckDuckGo occasionally rate-limits single attempts
+        last_err = None
+        for attempt in range(3):
+            try:
+                with DDGS() as ddgs:
+                    results = list(ddgs.text(query, max_results=8, region="wt-wt", timelimit="m"))
+                if results:
+                    return results, None
+                # No results with time limit — retry without it
+                with DDGS() as ddgs:
+                    results = list(ddgs.text(query, max_results=8, region="wt-wt"))
+                if results:
+                    return results, None
+            except Exception as e:
+                last_err = e
+        return [], last_err
 
     try:
-        results = await asyncio.to_thread(_fetch)
+        results, err = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=20)
+    except asyncio.TimeoutError:
+        return f"Search timed out for '{query}'. Try a shorter query."
     except Exception as e:
         return f"Error searching: {e}"
 
+    if err and not results:
+        return f"Search failed for '{query}': {err}"
+
     if not results:
-        return f"No results for '{query}'."
+        return f"No results found for '{query}'."
 
     lines = [f"**Web Search: {query}**\n"]
     for r in results:

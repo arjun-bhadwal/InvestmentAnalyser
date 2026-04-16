@@ -120,6 +120,20 @@ async def get_price_history(ticker: str, period: str = "1mo") -> str:
 # Fundamentals & Analyst Ratings
 # ---------------------------------------------------------------------------
 
+def _div_yield(info: dict) -> str:
+    """Return dividend yield as a clean percentage string.
+    yfinance returns dividendYield as a decimal fraction (0.0047 = 0.47%).
+    Guard against miscaled values: if result exceeds 25% it's likely already
+    in pct form, so use the raw value directly."""
+    dy = info.get("dividendYield") or info.get("trailingAnnualDividendYield")
+    if not dy:
+        return "N/A"
+    pct = float(dy) * 100          # expect: 0.0047 → 0.47%
+    if pct > 25:                    # sanity cap — almost certainly bad scale
+        pct = float(dy)             # treat raw value as already a percentage
+    return f"{pct:.2f}%"
+
+
 @mcp.tool()
 @cached(cache_fundamentals)
 async def get_stock_fundamentals(ticker: str) -> str:
@@ -176,7 +190,7 @@ async def get_stock_fundamentals(ticker: str) -> str:
         f"- 50d MA:          {currency} {_val('fiftyDayAverage')}\n"
         f"- 200d MA:         {currency} {_val('twoHundredDayAverage')}\n"
         f"- Beta:            {_val('beta')}\n"
-        f"- Dividend yield:  {_val('dividendYield', ',', 2, 0.01, '%')}\n\n"
+        f"- Dividend yield:  {_div_yield(info)}\n\n"
         f"**Company**\n"
         f"- Sector:   {sector}\n"
         f"- Industry: {industry}\n"
@@ -193,14 +207,17 @@ async def get_analyst_ratings(ticker: str) -> str:
     def _fetch():
         t = yf.Ticker(ticker)
         info = t.info
+        # yfinance ≥0.2.x: per-analyst history is in upgrades_downgrades
+        # .recommendations now returns aggregate period counts — not useful here
+        upgrades = None
         try:
-            recs = t.recommendations
+            upgrades = t.upgrades_downgrades
         except Exception:
-            recs = None
-        return info, recs
+            pass
+        return info, upgrades
 
     try:
-        info, recs = await asyncio.to_thread(_fetch)
+        info, upgrades = await asyncio.to_thread(_fetch)
     except Exception as e:
         return f"Error fetching analyst data for {ticker}: {e}"
 
@@ -230,18 +247,20 @@ async def get_analyst_ratings(ticker: str) -> str:
         sign = "+" if upside >= 0 else ""
         lines.append(f"- Implied upside: {sign}{upside:.1f}%")
 
-    if recs is not None and not recs.empty:
+    # Recent upgrades/downgrades from yfinance upgrades_downgrades
+    if upgrades is not None and not upgrades.empty:
         lines.append("")
-        lines.append("**Recent Analyst Recommendations**")
-        lines.append(f"{'Date':<14} {'Firm':<28} {'To Grade':<20} {'Action'}")
-        lines.append("-" * 74)
-        recent = recs.tail(8).iloc[::-1]
+        lines.append("**Recent Analyst Actions**")
+        lines.append(f"{'Date':<14} {'Firm':<28} {'To Grade':<22} {'Action'}")
+        lines.append("-" * 76)
+        # Most recent 8, newest first
+        recent = upgrades.head(8)
         for date, row in recent.iterrows():
             date_str = date.strftime("%d %b %Y") if hasattr(date, "strftime") else str(date)[:10]
-            firm  = str(row.get("Firm", ""))[:27]
-            grade = str(row.get("To Grade", row.get("toGrade", "")))[:19]
-            action = str(row.get("Action", row.get("action", "")))
-            lines.append(f"{date_str:<14} {firm:<28} {grade:<20} {action}")
+            firm     = str(row.get("Firm", ""))[:27]
+            to_grade = str(row.get("ToGrade", row.get("To Grade", "")))[:21]
+            action   = str(row.get("Action", ""))
+            lines.append(f"{date_str:<14} {firm:<28} {to_grade:<22} {action}")
 
     return "\n".join(lines)
 
@@ -263,7 +282,7 @@ async def get_market_snapshot() -> str:
     def _fetch():
         return yf.download(
             list(indices.values()),
-            period="2d",
+            period="5d",
             auto_adjust=True,
             progress=False,
         )
