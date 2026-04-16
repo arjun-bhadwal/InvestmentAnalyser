@@ -238,19 +238,30 @@ async def fetch_historic_prices(tickers: list[str], period: str = "1y", interval
     missing = set(unique_tickers) - set(closes.columns)
     
     # Fallback Heuristic
-    for m in missing:
-        base = m.split(".")[0]
-        alts = [base, f"{base}.L", f"{base}.PA", f"{base}.MI", f"{base}.AS", f"{base}.F", f"{base}.DE"]
-        for alt in alts:
-            if alt == m: continue
-            alt_data = await asyncio.to_thread(_fetch, [alt])
-            if not alt_data.empty:
-                alt_closes = alt_data["Close"] if isinstance(alt_data.columns, pd.MultiIndex) else alt_data[["Close"]].rename(columns={"Close": alt})
-                alt_closes = alt_closes.dropna(axis=1, how="all")
-                if alt in alt_closes.columns and len(alt_closes[alt].dropna()) > 30:
-                    # Successful recovery! Inject back to the dataframe
-                    closes[m] = alt_closes[alt]
-                    break
+    if missing:
+        import os, sys, contextlib
+        def _silent_fetch(syms):
+            with open(os.devnull, "w") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
+                return _fetch(syms)
+                
+        for m in missing:
+            base = m.split(".")[0]
+            alts = [base, f"{base}.L", f"{base}.PA", f"{base}.MI", f"{base}.AS", f"{base}.F", f"{base}.DE"]
+            recovered = False
+            for alt in alts:
+                if alt == m: continue
+                alt_data = await asyncio.to_thread(_silent_fetch, [alt])
+                if not alt_data.empty:
+                    alt_closes = alt_data["Close"] if isinstance(alt_data.columns, pd.MultiIndex) else alt_data[["Close"]].rename(columns={"Close": alt})
+                    alt_closes = alt_closes.dropna(axis=1, how="all")
+                    if alt in alt_closes.columns and len(alt_closes[alt].dropna()) > 30:
+                        # Successful recovery! Inject back to the dataframe
+                        closes[m] = alt_closes[alt]
+                        print(f"⚠️ {m} failed but was gracefully recovered using {alt} prices.")
+                        recovered = True
+                        break
+            if not recovered:
+                print(f"❌ {m} failed entirely across all global market fallbacks.")
                     
     return closes
 
