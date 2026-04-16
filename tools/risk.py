@@ -31,7 +31,7 @@ async def get_portfolio_risk() -> str:
     if not positions:
         return "No open positions to analyse."
 
-    tickers = [strip_t212_ticker(p["ticker"]) for p in positions]
+    tickers = list(dict.fromkeys(strip_t212_ticker(p["ticker"]) for p in positions))  # unique, ordered
 
     def _fetch():
         return yf.download(tickers + ["SPY"], period="1y", interval="1d", auto_adjust=True, progress=False)
@@ -41,10 +41,13 @@ async def get_portfolio_risk() -> str:
     except Exception as e:
         return f"Error fetching price history: {e}"
 
+    if data.empty:
+        return "No price data returned. Check that ticker symbols are valid."
+
     closes = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data[["Close"]].rename(columns={"Close": tickers[0]})
     closes = closes.dropna(how="all")
     if closes.empty:
-        return "Insufficient data."
+        return "Insufficient price data after filtering."
 
     returns = closes.pct_change().dropna()
     TRADING_DAYS = 252
@@ -57,27 +60,38 @@ async def get_portfolio_risk() -> str:
 
     lines = ["**Portfolio Risk Analytics — 1-Year Lookback**\n"]
 
+    # Filter to tickers that actually have data (>= 30 days)
+    available = [t for t in tickers if t in returns.columns and returns[t].dropna().shape[0] >= 30]
+    missing = [t for t in tickers if t not in available]
+    if missing:
+        lines.append(f"⚠️ Insufficient data for: {', '.join(missing)}\n")
+
+    if not available:
+        return "No tickers had sufficient price history (need 30+ trading days)."
+
     lines.append(f"{'Ticker':<10} {'Ann.Ret%':>10} {'Ann.Vol%':>10} {'Sharpe':>8} {'MaxDD%':>8} {'Beta':>7}")
     lines.append("-" * 58)
 
     spy_ret = returns.get("SPY")
+    spy_clean = spy_ret.dropna() if spy_ret is not None else pd.Series(dtype=float)
 
-    for t in tickers:
-        if t not in returns.columns:
-            continue
+    for t in available:
         r = returns[t].dropna()
+        if r.empty:
+            continue
         ann_ret = float(r.mean()) * TRADING_DAYS * 100
         ann_vol = float(r.std()) * np.sqrt(TRADING_DAYS) * 100
         sharpe = (ann_ret / 100 - RISK_FREE) / (ann_vol / 100) if ann_vol > 0 else 0
         cum = (1 + r).cumprod()
         max_dd = float(((cum / cum.cummax()) - 1).min()) * 100
 
-        if spy_ret is not None and t in returns.columns:
-            cov = np.cov(returns[t].dropna().values[-min(len(returns[t].dropna()), len(spy_ret.dropna())):],
-                         spy_ret.dropna().values[-min(len(returns[t].dropna()), len(spy_ret.dropna())):])
-            beta = cov[0][1] / cov[1][1] if cov[1][1] != 0 else 0
-        else:
-            beta = 0
+        beta = 0.0
+        if len(spy_clean) > 0:
+            # Align on overlapping dates
+            aligned = pd.concat([returns[t], spy_ret], axis=1, keys=[t, "SPY"]).dropna()
+            if len(aligned) >= 30:
+                cov = np.cov(aligned[t].values, aligned["SPY"].values)
+                beta = cov[0][1] / cov[1][1] if cov[1][1] != 0 else 0.0
 
         lines.append(f"{t:<10} {ann_ret:>+10.2f} {ann_vol:>10.2f} {sharpe:>8.2f} {max_dd:>+8.2f} {beta:>7.2f}")
 
@@ -85,7 +99,6 @@ async def get_portfolio_risk() -> str:
     total_val = sum(weights_raw.values()) or 1
     weights = {k: v / total_val for k, v in weights_raw.items()}
 
-    available = [t for t in tickers if t in returns.columns]
     if available:
         port_ret = sum(returns[t] * weights.get(t, 0) for t in available).dropna()
         if len(port_ret) > 5:
@@ -98,7 +111,8 @@ async def get_portfolio_risk() -> str:
             cum = (1 + port_ret).cumprod()
             max_dd = float(((cum / cum.cummax()) - 1).min()) * 100
             var95 = float(port_ret.quantile(0.05)) * 100
-            cvar95 = float(port_ret[port_ret <= port_ret.quantile(0.05)].mean()) * 100 if len(port_ret[port_ret <= port_ret.quantile(0.05)]) > 0 else var95
+            tail = port_ret[port_ret <= port_ret.quantile(0.05)]
+            cvar95 = float(tail.mean()) * 100 if len(tail) > 0 else var95
 
             lines.append("-" * 58)
             lines.append(f"\n**Portfolio Summary**")
@@ -119,7 +133,8 @@ async def get_portfolio_risk() -> str:
         for t1 in available:
             row_str = f"{t1[:6]:>8}"
             for t2 in available:
-                row_str += f"{float(corr.loc[t1, t2]):>8.2f}"
+                val = corr.loc[t1, t2]
+                row_str += f"{float(val):>8.2f}" if not np.isnan(val) else f"{'N/A':>8}"
             lines.append(row_str)
 
     return "\n".join(lines)
@@ -213,23 +228,39 @@ async def get_portfolio_stress_test(simulations: int = 1000) -> str:
     if not positions:
         return "No open positions."
 
-    tickers = [strip_t212_ticker(p["ticker"]) for p in positions]
+    tickers = list(dict.fromkeys(strip_t212_ticker(p["ticker"]) for p in positions))
     weights_raw = {strip_t212_ticker(p["ticker"]): position_value(p) for p in positions}
     total = sum(weights_raw.values()) or 1
     weights = {k: v / total for k, v in weights_raw.items()}
 
+    # Use max available history — try to go back as far as possible for scenarios
     def _fetch():
-        return yf.download(tickers, period="5y", interval="1d", auto_adjust=True, progress=False)
+        return yf.download(tickers, period="max", interval="1d", auto_adjust=True, progress=False)
 
     try:
         data = await asyncio.to_thread(_fetch)
     except Exception as e:
         return f"Error: {e}"
 
+    if data.empty:
+        return "No price data returned. Check that ticker symbols are valid."
+
     closes = data["Close"].dropna(how="all") if isinstance(data.columns, pd.MultiIndex) else data[["Close"]].rename(columns={"Close": tickers[0]})
     returns = closes.pct_change().dropna()
 
+    avail = [t for t in tickers if t in returns.columns and returns[t].dropna().shape[0] >= 30]
+    missing = [t for t in tickers if t not in avail]
+
     lines = ["**Portfolio Stress Test**\n"]
+    if missing:
+        lines.append(f"⚠️ Insufficient data for: {', '.join(missing)}\n")
+
+    if not avail:
+        return "No tickers had sufficient price history for stress testing."
+
+    # Determine earliest date available
+    earliest = returns.index.min().strftime("%Y-%m-%d")
+    lines.append(f"_Data available from: {earliest}_\n")
 
     scenarios = {
         "2008 Financial Crisis": ("2008-09-01", "2009-03-09"),
@@ -244,33 +275,38 @@ async def get_portfolio_stress_test(simulations: int = 1000) -> str:
     for name, (s, e) in scenarios.items():
         try:
             pr = returns.loc[s:e]
-            if pr.empty:
+            if pr.empty or len(pr) < 2:
                 lines.append(f"{name:<28} {'no data':>12}")
                 continue
-            port_ret = sum(pr.get(t, pd.Series([0])).sum() * weights.get(t, 0) for t in tickers)
+            port_ret = sum(
+                pr[t].sum() * weights.get(t, 0)
+                for t in avail if t in pr.columns
+            )
             lines.append(f"{name:<28} {port_ret*100:>+10.1f}%")
         except Exception:
             lines.append(f"{name:<28} {'N/A':>12}")
 
-    avail = [t for t in tickers if t in returns.columns]
     if avail:
         port_ret = sum(returns[t] * weights.get(t, 0) for t in avail).dropna()
         if len(port_ret) >= 20:
             mu = float(port_ret.mean())
             sig = float(port_ret.std())
-            np.random.seed(42)
-            sims = sorted([float(np.cumprod(1 + np.random.normal(mu, sig, 252))[-1] - 1) for _ in range(simulations)])
-            p5, p25, p50, p75, p95 = [sims[int(p * simulations)] for p in [.05, .25, .5, .75, .95]]
+            if sig > 0:  # guard against zero volatility
+                np.random.seed(42)
+                sims = sorted([float(np.cumprod(1 + np.random.normal(mu, sig, 252))[-1] - 1) for _ in range(simulations)])
+                p5, p25, p50, p75, p95 = [sims[int(p * simulations)] for p in [.05, .25, .5, .75, .95]]
 
-            lines += [
-                f"\n**Monte Carlo ({simulations:,} runs, 1yr)**",
-                f"- 5th pctile:  {p5*100:+.1f}%", f"- 25th:        {p25*100:+.1f}%",
-                f"- **Median:    {p50*100:+.1f}%**", f"- 75th:        {p75*100:+.1f}%",
-                f"- 95th pctile: {p95*100:+.1f}%", "",
-                f"- P(loss): {sum(1 for r in sims if r < 0)/simulations*100:.1f}%",
-                f"- P(>20% gain): {sum(1 for r in sims if r > .2)/simulations*100:.1f}%",
-                f"- P(>20% loss): {sum(1 for r in sims if r < -.2)/simulations*100:.1f}%",
-            ]
+                lines += [
+                    f"\n**Monte Carlo ({simulations:,} runs, 1yr)**",
+                    f"- 5th pctile:  {p5*100:+.1f}%", f"- 25th:        {p25*100:+.1f}%",
+                    f"- **Median:    {p50*100:+.1f}%**", f"- 75th:        {p75*100:+.1f}%",
+                    f"- 95th pctile: {p95*100:+.1f}%", "",
+                    f"- P(loss): {sum(1 for r in sims if r < 0)/simulations*100:.1f}%",
+                    f"- P(>20% gain): {sum(1 for r in sims if r > .2)/simulations*100:.1f}%",
+                    f"- P(>20% loss): {sum(1 for r in sims if r < -.2)/simulations*100:.1f}%",
+                ]
+            else:
+                lines.append("\n⚠️ Portfolio volatility is zero — cannot run Monte Carlo.")
 
     return "\n".join(lines)
 

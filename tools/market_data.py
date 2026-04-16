@@ -641,11 +641,29 @@ async def get_realtime_quote(ticker: str) -> str:
 @mcp.tool()
 async def get_market_status() -> str:
     """Return current market status (open/closed) and upcoming holidays via Polygon.io.
+    Falls back to a timezone-based estimate if Polygon is not configured.
     Use this to know if markets are trading right now."""
 
     client = _polygon_client()
     if not client:
-        return "POLYGON_API_KEY not set. Add it to .env for market status data."
+        # Fallback: estimate from time zones
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        now_uk = datetime.now(ZoneInfo("Europe/London"))
+        weekday = now_et.weekday()  # 0=Mon, 6=Sun
+        is_weekend = weekday >= 5
+        us_open = not is_weekend and 9 <= now_et.hour < 16 and not (now_et.hour == 9 and now_et.minute < 30)
+        lse_open = not is_weekend and 8 <= now_uk.hour < 16 and not (now_uk.hour == 16 and now_uk.minute > 30)
+
+        lines = [
+            f"**Market Status — {now_et.strftime('%d %b %Y %H:%M ET')}**\n",
+            f"- NYSE/NASDAQ: **{'OPEN' if us_open else 'CLOSED'}** (9:30–16:00 ET)",
+            f"- LSE:         **{'OPEN' if lse_open else 'CLOSED'}** (08:00–16:30 GMT)",
+            f"- Weekend:     {'Yes ⛔' if is_weekend else 'No'}",
+            "",
+            "_⚠️ Estimate only — does not account for holidays. Set POLYGON_API_KEY for precise status._",
+        ]
+        return "\n".join(lines)
 
     def _fetch():
         status = client.get_market_status()

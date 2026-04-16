@@ -71,17 +71,30 @@ async def get_macro_dashboard() -> str:
             from fredapi import Fred
             fred = Fred(api_key=app.FRED_API_KEY)
             indicators = {
-                "Fed Funds Rate": "FEDFUNDS", "CPI YoY %": "CPIAUCSL",
-                "Core CPI YoY %": "CPILFESL", "Unemployment Rate %": "UNRATE",
-                "Real GDP Growth % (QoQ)": "A191RL1Q225SBEA",
-                "Consumer Confidence": "UMCSENT", "10Y-2Y Spread (bp)": "T10Y2Y",
+                "Fed Funds Rate": ("FEDFUNDS", False),
+                "CPI YoY %": ("CPIAUCSL", True),       # index — compute YoY%
+                "Core CPI YoY %": ("CPILFESL", True),   # index — compute YoY%
+                "Unemployment Rate %": ("UNRATE", False),
+                "Real GDP Growth % (QoQ)": ("A191RL1Q225SBEA", False),
+                "Consumer Confidence": ("UMCSENT", False),
+                "10Y-2Y Spread (bp)": ("T10Y2Y", False),
             }
             lines.append("\n**Economic Indicators (FRED)**")
-            for label, sid in indicators.items():
+            for label, (sid, compute_yoy) in indicators.items():
                 try:
-                    data = fred.get_series(sid, observation_start=(datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d"))
+                    data = fred.get_series(sid, observation_start=(datetime.today() - timedelta(days=730)).strftime("%Y-%m-%d"))
                     if data is not None and len(data) > 0:
-                        lines.append(f"- {label}: {float(data.dropna().iloc[-1]):.2f}")
+                        data = data.dropna()
+                        if compute_yoy and len(data) >= 13:
+                            # Compute YoY% from index: (current - 12mo ago) / 12mo ago * 100
+                            current_val = float(data.iloc[-1])
+                            year_ago_val = float(data.iloc[-13])  # ~12 monthly observations ago
+                            yoy_pct = (current_val - year_ago_val) / year_ago_val * 100
+                            lines.append(f"- {label}: {yoy_pct:.2f}%")
+                        else:
+                            lines.append(f"- {label}: {float(data.iloc[-1]):.2f}")
+                    else:
+                        lines.append(f"- {label}: N/A")
                 except Exception:
                     lines.append(f"- {label}: N/A")
 
