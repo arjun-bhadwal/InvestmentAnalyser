@@ -53,12 +53,9 @@ async def _get_stock_fundamentals(ticker: str) -> str:
     """Return key fundamental data for a stock: P/E, EPS, market cap, revenue, margins, 52w range, beta, dividend.
     Use this for fundamental analysis and valuation."""
 
-    def _fetch():
-        from resolver import fetch_fundamental_dict
-        return asyncio.run(fetch_fundamental_dict(ticker))
-
+    from resolver import fetch_fundamental_dict
     try:
-        rt, info = await asyncio.to_thread(_fetch)
+        rt, info = await asyncio.wait_for(fetch_fundamental_dict(ticker), timeout=15.0)
     except Exception as e:
         return f"Error fetching fundamentals for {ticker}: {e}"
 
@@ -455,15 +452,20 @@ async def _compare_peers(tickers: str) -> str:
     symbols = symbols[:6]
 
     async def _get(sym):
-        def _f():
-            from resolver import fetch_fundamental_dict
-            rt, i = asyncio.run(fetch_fundamental_dict(sym))
-            t = yf.Ticker(sym)
-            return i, t.history(period="1y", interval="1d", auto_adjust=True)
+        from resolver import fetch_fundamental_dict
         try:
-            return sym, *(await asyncio.to_thread(_f))
+            rt, info = await asyncio.wait_for(fetch_fundamental_dict(sym), timeout=15.0)
+            yf_sym = rt.yf_symbol
         except Exception:
-            return sym, {}, pd.DataFrame()
+            info, yf_sym = {}, sym
+
+        def _hist():
+            return yf.Ticker(yf_sym).history(period="1y", interval="1d", auto_adjust=True)
+        try:
+            hist = await asyncio.wait_for(asyncio.to_thread(_hist), timeout=10.0)
+        except Exception:
+            hist = pd.DataFrame()
+        return sym, info, hist
 
     results = await asyncio.gather(*[_get(s) for s in symbols])
 

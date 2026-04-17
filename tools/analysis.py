@@ -263,37 +263,58 @@ async def get_earnings_calendar() -> str:
             info = t.info
             return cal, info
         try:
-            cal, info = await asyncio.to_thread(_f)
+            cal, info = await asyncio.wait_for(asyncio.to_thread(_f), timeout=8.0)
             return ticker, cal, info
         except Exception:
             return ticker, None, {}
 
     results = await asyncio.gather(*[_fetch_earnings(t) for t in tickers])
 
-    lines = [
-        f"**Earnings Calendar — Portfolio**\n",
-        f"{'Ticker':<10} {'Next Earnings':<20} {'EPS (TTM)':>12} {'EPS (Fwd)':>12} {'Surprise':>10}",
-        "-" * 68,
+    # Filter out ETFs, ETCs, and funds — they have no earnings data
+    equity_results = [
+        (ticker, cal, info) for ticker, cal, info in results
+        if info.get("quoteType", "EQUITY") in ("EQUITY", "")
     ]
 
-    for ticker, cal, info in sorted(results, key=lambda x: str(x[1].get("Earnings Date", ["9999"]) if isinstance(x[1], dict) else "9999")):
+    if not equity_results:
+        return "**Earnings Calendar — Portfolio**\n\nNo equity positions with earnings data found."
+
+    lines = [
+        f"**Earnings Calendar — Portfolio**\n",
+        f"{'Ticker':<10} {'Next Earnings':<20} {'EPS (TTM)':>12} {'EPS (Fwd)':>12} {'Fwd vs TTM':>12}",
+        "-" * 70,
+    ]
+
+    def _sort_key(row):
+        _, cal, _ = row
+        if isinstance(cal, dict):
+            dates = cal.get("Earnings Date", [])
+            if dates:
+                return str(dates[0])[:10]
+        return "9999"
+
+    for ticker, cal, info in sorted(equity_results, key=_sort_key):
         eps_ttm = info.get("trailingEps")
         eps_fwd = info.get("forwardEps")
-        eps_ttm_str = f"{float(eps_ttm):,.2f}" if eps_ttm else "N/A"
-        eps_fwd_str = f"{float(eps_fwd):,.2f}" if eps_fwd else "N/A"
+        eps_ttm_str = f"{float(eps_ttm):,.2f}" if eps_ttm is not None else "N/A"
+        eps_fwd_str = f"{float(eps_fwd):,.2f}" if eps_fwd is not None else "N/A"
 
         next_date = "N/A"
         if isinstance(cal, dict):
             dates = cal.get("Earnings Date", [])
             if dates:
-                next_date = str(dates[0])[:10] if hasattr(dates[0], 'strftime') else str(dates[0])[:10]
+                next_date = str(dates[0])[:10] if hasattr(dates[0], "strftime") else str(dates[0])[:10]
 
-        surprise = ""
-        if eps_ttm and eps_fwd:
-            diff = (float(eps_fwd) - float(eps_ttm)) / abs(float(eps_ttm)) * 100 if eps_ttm else 0
-            surprise = f"{diff:+.1f}%"
+        fwd_vs_ttm = ""
+        if eps_ttm is not None and eps_fwd is not None and float(eps_ttm) != 0:
+            diff = (float(eps_fwd) - float(eps_ttm)) / abs(float(eps_ttm)) * 100
+            fwd_vs_ttm = f"{diff:+.1f}%"
 
-        lines.append(f"{ticker:<10} {next_date:<20} {eps_ttm_str:>12} {eps_fwd_str:>12} {surprise:>10}")
+        lines.append(f"{ticker:<10} {next_date:<20} {eps_ttm_str:>12} {eps_fwd_str:>12} {fwd_vs_ttm:>12}")
+
+    skipped = [ticker for ticker, _, info in results if info.get("quoteType", "EQUITY") not in ("EQUITY", "")]
+    if skipped:
+        lines.append(f"\n_Skipped (ETF/ETC/Fund): {', '.join(skipped)}_")
 
     return "\n".join(lines)
 
