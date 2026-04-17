@@ -74,9 +74,7 @@ async def _get_insider_trades_core(ticker: str) -> str:
     lines.append(f"Total insider selling: ${total_sell:>14,.0f}")
 
     ratio = total_buy / total_sell if total_sell > 0 else float("inf")
-    if ratio > 2:   lines.append(f"\n✅ **STRONG INSIDER BUYING** — ratio: {ratio:.1f}x")
-    elif ratio > 1: lines.append(f"\n🟢 Net insider buying — ratio: {ratio:.1f}x")
-    elif ratio > 0.5: lines.append(f"\n🟡 Mixed insider activity — ratio: {ratio:.1f}x")
-    else: lines.append(f"\n🔴 Heavy insider selling — ratio: {ratio:.2f}x")
+    ratio_str = f"{ratio:.2f}x" if ratio != float("inf") else "∞ (no sales)"
+    lines.append(f"\nInsider buy/sell ratio (90d): {ratio_str}  (buys: ${total_buy:,.0f} | sells: ${total_sell:,.0f})")
 
     return "\n".join(lines)

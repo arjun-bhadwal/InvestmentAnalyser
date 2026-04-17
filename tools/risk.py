@@ -207,7 +207,7 @@ async def calculate_position_size(
                    f"- Full Kelly: {ks:,} shares  |  Half-Kelly (safer): {ks//2:,} shares"]
 
     if pos_pct > 20:
-        lines.append(f"\n⚠️ **CONCENTRATION**: {pos_pct:.1f}% — consider reducing to <10%.")
+        lines.append(f"\nPosition weight: {pos_pct:.1f}% of portfolio")
 
     return "\n".join(lines)
 
@@ -396,10 +396,10 @@ async def _get_portfolio_allocation() -> str:
     lines += [
         f"\n**Concentration**",
         f"- Positions: {len(holdings)}  |  Top 5: {top5:.1f}%",
-        f"- HHI: {hhi:.4f} ({'concentrated' if hhi > .15 else 'moderate' if hhi > .08 else 'diversified'})  |  Effective positions: {1/hhi:.1f}",
+        f"- HHI: {hhi:.4f}  |  Effective positions: {1/hhi:.1f}",
     ]
     if top5 > 70:
-        lines.append(f"\n⚠️ Top 5 = {top5:.0f}% — heavy concentration")
+        lines.append(f"\nTop 5 = {top5:.0f}%")
 
     return "\n".join(lines)
 

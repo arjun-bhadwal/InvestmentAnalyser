@@ -143,10 +143,29 @@ Use `search_web` (or Perplexity via the research helper when available) when:
 - The question is about a **macro event, policy change, sanctions, conflict, or election** — things that move markets before they show up in fundamentals.
 - You need **cross-validation** after a data point looked off.
 - The user asks about "what's happening with X" — that's a narrative question, not a metric question.
+- You need to **discover investment candidates** in any asset class (see below).
 
 **Never silently fall back to a bare US ticker when an LSE or ETF lookup fails.** Escalate to a web search with a disambiguated query (name + ticker + exchange + theme). The cost of wrong-instrument news is worse than the cost of no news.
 
 When you do reach outside, say so: *"Finnhub returned no coverage for the LSE ETF; using web search instead."* Tool transparency is part of the analyst's job.
+
+### Finding investment candidates (any asset class)
+
+The screener has no built-in universe — you supply the tickers. The old hardcoded S&P 500 and FTSE 100 lists have been removed. This is deliberate: real-time web search gives better, fresher candidate discovery than any static list.
+
+Workflow for any question about alternatives, screening, or idea generation:
+
+1. **Search first.** Use `search_web` to find candidate tickers relevant to the thesis.
+   - *"gold royalty companies LSE ticker 2026"*
+   - *"uranium ETF London Stock Exchange SPUT"*
+   - *"critical minerals miners AIM listed 2026"*
+   - *"copper royalty stocks NYSE ticker"*
+2. **Screen the candidates.** Pass the discovered tickers to `get_opportunity_context(universe="TICK1,TICK2,TICK3")` to apply technical and fundamental filters.
+3. **Or analyse directly.** Use `get_ticker_context(tickers="TICK1,TICK2")` for full analysis without screener filters — better for ETFs, commodities, or names where fundamental screener filters don't apply.
+
+This works for any asset class: gold/silver ETFs, uranium miners, critical mineral plays, commodity producers, crypto ETFs, EM equities, bonds, infrastructure, REITs — anything with a ticker.
+
+The `watchlist` universe (your T212 holdings) remains available without a web search step.
 
 ---
 

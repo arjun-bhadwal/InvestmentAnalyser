@@ -87,37 +87,37 @@ async def _get_technical_indicators_core(ticker: str) -> str:
     signals = []
     if rsi is not None:
         if rsi < 30:
-            signals.append("RSI OVERSOLD — potential reversal / buy zone")
+            signals.append(f"RSI: {rsi:.1f} (below 30 threshold)")
         elif rsi > 70:
-            signals.append("RSI OVERBOUGHT — caution, potential pullback")
+            signals.append(f"RSI: {rsi:.1f} (above 70 threshold)")
         else:
-            signals.append(f"RSI neutral ({rsi:.1f})")
+            signals.append(f"RSI: {rsi:.1f}")
 
     if ma20 and ma50:
-        signals.append("MA20 > MA50 — short-term uptrend" if ma20 > ma50 else "MA20 < MA50 — short-term downtrend")
+        signals.append("MA20 > MA50" if ma20 > ma50 else "MA20 < MA50")
 
     if ma50 and ma200:
-        signals.append("Golden Cross: MA50 > MA200 — bullish long-term" if ma50 > ma200 else "Death Cross: MA50 < MA200 — bearish long-term")
+        signals.append("Golden Cross (MA50 > MA200)" if ma50 > ma200 else "Death Cross (MA50 < MA200)")
 
     if macd_val is not None and macd_sig is not None and macd_hist is not None:
         prev_hist = float(prev.get("macd_hist") or 0)
         if macd_hist > 0 and prev_hist <= 0:
-            signals.append("MACD bullish crossover — momentum turning positive")
+            signals.append("MACD histogram crossed positive")
         elif macd_hist < 0 and prev_hist >= 0:
-            signals.append("MACD bearish crossover — momentum turning negative")
+            signals.append("MACD histogram crossed negative")
         elif macd_hist > 0:
-            signals.append("MACD positive — bullish momentum")
+            signals.append("MACD histogram positive")
         else:
-            signals.append("MACD negative — bearish momentum")
+            signals.append("MACD histogram negative")
 
     if bb_upper and bb_lower and bb_mid:
         bb_pct = (price - bb_lower) / (bb_upper - bb_lower) * 100 if (bb_upper - bb_lower) > 0 else 50
         if bb_pct > 90:
-            signals.append(f"Price near upper Bollinger Band ({bb_pct:.0f}%) — extended")
+            signals.append(f"Price at upper BB ({bb_pct:.0f}% of range)")
         elif bb_pct < 10:
-            signals.append(f"Price near lower Bollinger Band ({bb_pct:.0f}%) — oversold zone")
+            signals.append(f"Price at lower BB ({bb_pct:.0f}% of range)")
         else:
-            signals.append(f"Price within Bollinger Bands ({bb_pct:.0f}% of range)")
+            signals.append(f"Price within BB ({bb_pct:.0f}% of range)")
 
     lines = [
         f"**{rt.yf_symbol} — Technical Indicators** ({rt.currency})\n",
@@ -302,29 +302,8 @@ async def get_earnings_calendar() -> str:
 # Stock Screener
 # ---------------------------------------------------------------------------
 
-_SP500_TICKERS = [
-    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","BRK-B","TSLA","AVGO","JPM",
-    "LLY","V","UNH","XOM","MA","JNJ","PG","COST","HD","MRK","ABBV","CVX",
-    "KO","PEP","ADBE","WMT","BAC","CRM","ACN","MCD","TMO","CSCO","ABT","LIN",
-    "NFLX","AMD","TXN","DHR","NKE","PM","NEE","INTC","ORCL","UPS","QCOM",
-    "HON","LOW","UNP","RTX","AMGN","CAT","GS","SPGI","IBM","DE","AXP","BLK",
-    "ISRG","NOW","INTU","SYK","GILD","LMT","PLD","ADI","REGN","MDLZ","CI",
-    "MMC","ZTS","MO","DUK","SO","TGT","ETN","ITW","PGR","AON","CME","CL",
-    "APD","SHW","EW","WM","NSC","GD","F","GM","PYPL","SBUX","PANW","SNOW",
-    "CRWD","UBER","ABNB","COIN","PLTR","ARM",
-]
-
-_FTSE100_TICKERS = [
-    "SHEL.L","AZN.L","HSBA.L","BP.L","ULVR.L","RIO.L","GSK.L","REL.L",
-    "DGE.L","NG.L","LLOY.L","BARC.L","BT-A.L","VOD.L","STAN.L","RR.L",
-    "EXPN.L","LSEG.L","CPG.L","IMB.L","MKS.L","TSCO.L","BATS.L","AAL.L",
-    "ANTO.L","CCH.L","CNA.L","ENT.L","FRES.L","HLN.L","JMAT.L","KGF.L",
-    "MNDI.L","NWG.L","PHNX.L","PRU.L","SGE.L","SMDS.L","SSE.L","WPP.L",
-]
-
-
 async def _screen_stocks_core(
-    universe: str = "sp500",
+    universe: str = "watchlist",
     max_rsi: float = 40.0,
     min_rsi: float = 0.0,
     require_above_ma200: bool = True,
@@ -334,25 +313,21 @@ async def _screen_stocks_core(
     min_momentum_1m_pct: float = 0.0,
     max_results: int = 20,
 ) -> str:
-    """Scan a universe of stocks for high-conviction entry setups.
+    """Scan a set of tickers for entry setups using technical and fundamental filters.
 
-    universe: "sp500" | "ftse100" | "both" | "watchlist" | comma-separated tickers
-    max_rsi: filter stocks with RSI below this (default 40 = oversold zone)
-    min_rsi: filter stocks with RSI above this (default 0 = no floor)
-    require_above_ma200: only include stocks trading above their 200-day MA
-    require_above_ma50: only include stocks trading above their 50-day MA
+    universe: "watchlist" (your T212 holdings) | comma-separated tickers
+              Use search_web to discover candidates first, then pass them here.
+              Example: "CCJ,UEC,DNN.TO,SPUT.TO" or "SGLN.L,PHAU.L,GLD,IAU"
+    max_rsi: only include tickers with RSI below this value
+    min_rsi: only include tickers with RSI above this value
+    require_above_ma200: only include tickers trading above their 200-day MA
+    require_above_ma50: only include tickers trading above their 50-day MA
     min_analyst_upside_pct: minimum analyst mean target upside %
     max_pe: maximum trailing P/E ratio — 0 = no filter
     min_momentum_1m_pct: minimum 1-month return % — 0 = no filter
     max_results: cap on results"""
 
-    if universe == "sp500":
-        tickers = list(_SP500_TICKERS)
-    elif universe == "ftse100":
-        tickers = list(_FTSE100_TICKERS)
-    elif universe == "both":
-        tickers = list(_SP500_TICKERS) + list(_FTSE100_TICKERS)
-    elif universe == "watchlist":
+    if universe == "watchlist":
         try:
             positions = await app.t212.get_portfolio()
             tickers = [strip_t212_ticker(p["ticker"]) for p in positions]
