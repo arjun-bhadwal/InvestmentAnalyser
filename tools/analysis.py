@@ -364,21 +364,50 @@ async def _screen_stocks_core(
     if not tickers:
         return "No tickers to screen."
 
-    def _batch(syms):
-        raw = yf.download(syms, period="1y", interval="1d", auto_adjust=True, progress=False)
-        if isinstance(raw.columns, pd.MultiIndex):
-            return raw["Close"]
-        return raw[["Close"]].rename(columns={"Close": syms[0]})
+    async def _batch_parallel(syms):
+        """Download in sub-batches if the main download yields nothing."""
+        # Try full batch first
+        try:
+            df = await asyncio.to_thread(yf.download, syms, period="1y", interval="1d", auto_adjust=True, progress=False)
+            if not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    return df["Close"]
+                return df[["Close"]].rename(columns={"Close": syms[0]})
+        except Exception:
+            pass
+
+        # If failed, try smaller chunks of 10
+        chunk_size = 10
+        chunks = [syms[i:i + chunk_size] for i in range(0, len(syms), chunk_size)]
+        
+        async def _get_chunk(c):
+            try:
+                d = await asyncio.to_thread(yf.download, c, period="1y", interval="1d", auto_adjust=True, progress=False)
+                if d.empty: return pd.DataFrame()
+                if isinstance(d.columns, pd.MultiIndex):
+                    return d["Close"]
+                return d[["Close"]].rename(columns={"Close": c[0]})
+            except Exception:
+                return pd.DataFrame()
+        
+        results = await asyncio.gather(*[_get_chunk(c) for c in chunks])
+        valid_dfs = [r for r in results if not r.empty]
+        if not valid_dfs:
+            return pd.DataFrame()
+        return pd.concat(valid_dfs, axis=1)
 
     try:
-        closes = await asyncio.to_thread(_batch, tickers)
+        closes = await _batch_parallel(tickers)
     except Exception as e:
         return f"Error downloading price data: {e}"
 
+    if closes.empty:
+        return "Insufficient price data found for this universe."
+    
     closes = closes.dropna(how="all")
     available = [c for c in closes.columns if closes[c].notna().sum() >= 60]
     if not available:
-        return "Insufficient price data."
+        return "Insufficient price data (too many NaNs in history)."
 
     candidates = []
     for sym in available:

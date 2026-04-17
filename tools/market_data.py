@@ -54,14 +54,37 @@ async def _get_stock_fundamentals(ticker: str) -> str:
     Use this for fundamental analysis and valuation."""
 
     def _fetch():
-        return yf.Ticker(ticker).info
+        from resolver import fetch_fundamental_dict
+        return asyncio.run(fetch_fundamental_dict(ticker))
 
     try:
-        info = await asyncio.to_thread(_fetch)
+        rt, info = await asyncio.to_thread(_fetch)
     except Exception as e:
         return f"Error fetching fundamentals for {ticker}: {e}"
 
-    if not info or info.get("trailingPe") is None and info.get("marketCap") is None:
+    if not info or (not info.get("marketCap") and not info.get("trailingPE")):
+        # If yfinance is still empty, attempt Finnhub fallback for basic profile
+        try:
+            from helpers import finnhub_retry
+            import finnhub
+            
+            @finnhub_retry
+            def _fh_profile():
+                client = finnhub.Client(api_key=app.FINNHUB_API_KEY)
+                # Finnhub: LSE:AZN for UK tickers
+                fh_sym = f"LSE:{ticker.split('.')[0]}" if ticker.endswith(".L") else ticker
+                return client.company_profile2(symbol=fh_sym)
+                
+            profile = await asyncio.to_thread(_fh_profile)
+            if profile:
+                info["marketCap"] = profile.get("marketCapitalization", 0) * 1e6 # Finnhub is in Millions
+                info["longName"] = profile.get("name")
+                info["sector"] = profile.get("finnhubIndustry")
+                info["currency"] = profile.get("currency")
+        except Exception:
+            pass
+
+    if not info or (not info.get("marketCap") and not info.get("trailingPE") and not info.get("longName")):
         return f"No fundamental data found for '{ticker}'."
 
     def _val(key, fmt=",", decimals=2, scale=1, suffix=""):
@@ -436,8 +459,10 @@ async def _compare_peers(tickers: str) -> str:
 
     async def _get(sym):
         def _f():
+            from resolver import fetch_fundamental_dict
+            rt, i = asyncio.run(fetch_fundamental_dict(sym))
             t = yf.Ticker(sym)
-            return t.info, t.history(period="1y", interval="1d", auto_adjust=True)
+            return i, t.history(period="1y", interval="1d", auto_adjust=True)
         try:
             return sym, *(await asyncio.to_thread(_f))
         except Exception:

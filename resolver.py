@@ -409,6 +409,39 @@ async def fetch_fast_price(
     return rt, last, prev
 
 
+async def fetch_fundamental_dict(raw: str) -> tuple[ResolvedTicker, dict]:
+    """Fetch essential fundamental data merging .info and .fast_info.
+    This provides resilience against yfinance returning empty .info dicts."""
+    rt = await aresolve(raw)
+    
+    def _fetch():
+        t = yf.Ticker(rt.yf_symbol)
+        info = {}
+        try:
+            info = t.info or {}
+        except Exception:
+            pass
+            
+        # Merge key metrics from fast_info if missing in info
+        try:
+            fi = t.fast_info
+            if not info.get("marketCap") and getattr(fi, "market_cap", None):
+                info["marketCap"] = fi.market_cap
+            if not info.get("currentPrice") and getattr(fi, "last_price", None):
+                info["currentPrice"] = fi.last_price
+            if not info.get("currency") and getattr(fi, "currency", None):
+                info["currency"] = fi.currency
+            if not info.get("sharesOutstanding") and getattr(fi, "shares", None):
+                info["sharesOutstanding"] = fi.shares
+        except Exception:
+            pass
+            
+        return info
+
+    info = await asyncio.to_thread(_fetch)
+    return rt, info
+
+
 async def fetch_historic_prices_scaled(
     raws: list[str], period: str = "1y", interval: str = "1d",
 ) -> tuple[dict[str, ResolvedTicker], pd.DataFrame]:

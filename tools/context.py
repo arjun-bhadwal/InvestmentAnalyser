@@ -349,15 +349,35 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
 # ===========================================================================
 
 @mcp.tool()
-async def get_ticker_context(ticker: str, depth: str = "standard") -> str:
-    """Full ticker bundle — one call returns: multi-horizon performance (1W/1M/3M/1Y),
-    fundamentals, technical indicators (RSI, MACD, MAs, ATR, BB), analyst consensus,
-    and recent headlines.
+async def get_ticker_context(tickers: str, depth: str = "standard") -> str:
+    """Full ticker bundle(s) — one call returns: multi-horizon performance (1W/1M/3M/1Y),
+    fundamentals, technical indicators, analyst consensus, and headlines.
 
+    tickers: comma-separated list of symbols (e.g. 'AAPL, MSFT'). Max 5.
     depth: 'standard' (default) | 'deep' (adds DCF, insider trades, financial statements)
 
-    Use this before analysing any individual ticker. Avoids the N+1 call pattern.
+    Avoids the N+1 call pattern by batching deep context for multiple assets.
     """
+    syms = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if not syms:
+        return "Please provide at least one ticker."
+    
+    # Cap batch size to avoid massive responses and timeouts
+    target_syms = syms[:5]
+    
+    results = await asyncio.gather(*[_get_single_ticker_context(s, depth) for s in target_syms])
+    
+    combined = "\n\n" + "="*80 + "\n\n"
+    combined = combined.join(results)
+    
+    if len(syms) > 5:
+        combined += f"\n\n_Note: Batch capped at first 5 tickers. Omitted: {', '.join(syms[5:])}_"
+        
+    return combined
+
+
+async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> str:
+    """Internal helper to fetch detailed context for a single symbol."""
     from resolver import aresolve, fetch_history
     from tools.market_data import _get_stock_fundamentals, _get_analyst_ratings, _get_dcf_valuation, _get_financial_statements
     from tools.news import _get_news_core
@@ -376,10 +396,10 @@ async def get_ticker_context(ticker: str, depth: str = "standard") -> str:
 
     # ── Parallel fetches: 1y price history + fundamentals + news ─────────────
     async def _fetch_info():
-        def _f():
-            return yf.Ticker(sym).info
+        from resolver import fetch_fundamental_dict
         try:
-            return await asyncio.to_thread(_f)
+            _, info = await fetch_fundamental_dict(ticker)
+            return info
         except Exception:
             return {}
 
