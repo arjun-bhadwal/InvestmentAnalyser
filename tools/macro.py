@@ -59,11 +59,11 @@ async def _get_macro_dashboard() -> str:
 
         vix = market.get("VIX Fear Index (^VIX)", (None,))[0]
         if vix is not None:
-            if vix < 15: sig = "LOW FEAR — complacency, potential for surprise vol"
-            elif vix < 20: sig = "NORMAL — market calm"
-            elif vix < 30: sig = "ELEVATED — uncertainty, caution warranted"
-            else: sig = "HIGH FEAR — panic selling, contrarian buy zone"
-            lines.append(f"\n**VIX Signal:** {sig}")
+            if vix < 15: sig = f"VIX {vix:.1f} (below 15)"
+            elif vix < 20: sig = f"VIX {vix:.1f} (15–20)"
+            elif vix < 30: sig = f"VIX {vix:.1f} (20–30)"
+            else: sig = f"VIX {vix:.1f} (above 30)"
+            lines.append(f"\n**VIX:** {sig}")
 
     if app.FRED_API_KEY:
         try:
@@ -101,10 +101,7 @@ async def _get_macro_dashboard() -> str:
                 spread = fred.get_series("T10Y2Y")
                 if spread is not None and len(spread) > 0:
                     ls = float(spread.dropna().iloc[-1])
-                    if ls < 0:
-                        lines.append(f"\n> ⚠️ **YIELD CURVE INVERTED** ({ls:.2f}%) — recession signal")
-                    elif ls < 0.5:
-                        lines.append(f"\n> ⚡ Yield curve flattening ({ls:.2f}%)")
+                    lines.append(f"- 10Y-2Y Spread: {ls:.2f}%")
             except Exception:
                 pass
         except ImportError:
@@ -172,47 +169,34 @@ async def _get_fear_greed_index() -> str:
         vix = d["vix"]
         s = max(0, min(100, 100 - (vix - 12) * (100 / 28)))
         scores.append(s)
-        lbl = "Extreme Fear" if vix > 30 else "Fear" if vix > 20 else "Neutral" if vix > 15 else "Greed" if vix > 12 else "Extreme Greed"
-        components.append(f"- VIX ({vix:.1f}): **{lbl}** → score {s:.0f}")
+        components.append(f"- VIX ({vix:.1f}): score {s:.0f}")
 
     if d["spy_price"] is not None and d["spy_ma125"] is not None:
         pct = (d["spy_price"] / d["spy_ma125"] - 1) * 100
         s = max(0, min(100, 50 + pct * 5))
         scores.append(s)
-        components.append(f"- Momentum (SPY {pct:+.1f}% vs MA125): **{'Greedy' if pct > 5 else 'Fearful' if pct < -5 else 'Neutral'}** → score {s:.0f}")
+        components.append(f"- Momentum (SPY {pct:+.1f}% vs MA125): score {s:.0f}")
 
     if d["breadth_pct"] is not None:
         scores.append(d["breadth_pct"])
-        components.append(f"- Breadth ({d['breadth_pct']:.0f}% above MA50): **{'Strong' if d['breadth_pct'] > 70 else 'Weak' if d['breadth_pct'] < 30 else 'Mixed'}** → score {d['breadth_pct']:.0f}")
+        components.append(f"- Breadth ({d['breadth_pct']:.0f}% of tracked stocks above MA50): score {d['breadth_pct']:.0f}")
 
     if d["safe_haven_diff"] is not None:
         sh = d["safe_haven_diff"]
         s = max(0, min(100, 50 - sh * 5))
         scores.append(s)
-        components.append(f"- Safe Haven (Gold vs SPY 1M: {sh:+.1f}%): **{'Fear' if sh > 2 else 'Greed' if sh < -2 else 'Neutral'}** → score {s:.0f}")
+        components.append(f"- Safe Haven (Gold vs SPY 1M: {sh:+.1f}%): score {s:.0f}")
 
     if not scores:
         return "Insufficient data."
 
     composite = sum(scores) / len(scores)
-    if composite <= 20: reading = "🔴 EXTREME FEAR"
-    elif composite <= 40: reading = "🟠 FEAR"
-    elif composite <= 60: reading = "🟡 NEUTRAL"
-    elif composite <= 80: reading = "🟢 GREED"
-    else: reading = "🟢 EXTREME GREED"
 
     return "\n".join([
         f"**Fear & Greed Index — {datetime.today().strftime('%d %b %Y')}**\n",
-        f"## {reading} — Score: {composite:.0f}/100\n",
+        f"## Composite Score: {composite:.0f}/100\n",
         "**Components:**",
-    ] + components + [
-        "", "**Interpretation:**",
-        "- 0-25: Extreme Fear — contrarian buy zone",
-        "- 25-45: Fear — cautious",
-        "- 45-55: Neutral",
-        "- 55-75: Greed — momentum favours bulls",
-        "- 75-100: Extreme Greed — caution, potential top",
-    ])
+    ] + components)
 
 
 # ===========================================================================

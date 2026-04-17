@@ -415,8 +415,6 @@ async def _get_dcf_valuation(ticker: str, growth_rate_pct: float = 0.0, discount
     intrinsic = equity_val / shares
     mos = (intrinsic - current_price) / intrinsic * 100
 
-    verdict = "UNDERVALUED ✅" if mos > 15 else "FAIRLY VALUED ⚖️" if mos > -10 else "OVERVALUED ⚠️"
-
     lines = [
         f"**{name} ({ticker.upper()}) — DCF Valuation**\n",
         f"**Inputs**",
@@ -434,9 +432,8 @@ async def _get_dcf_valuation(ticker: str, growth_rate_pct: float = 0.0, discount
         f"- Intrinsic value/share: **{currency} {intrinsic:,.2f}**",
         f"- Current price:         {currency} {current_price:,.2f}",
         f"- Margin of safety:      {mos:+.1f}%",
-        f"- Verdict:               **{verdict}**",
         "",
-        f"⚠️ DCF is sensitive to growth/discount assumptions. Use as one input among many.",
+        f"Note: DCF is sensitive to growth/discount assumptions. Use as one input among many.",
     ]
 
     return "\n".join(lines)

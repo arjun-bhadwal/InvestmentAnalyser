@@ -602,19 +602,21 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
 
 @mcp.tool()
 async def get_opportunity_context(
-    universe: str = "sp500",
+    universe: str = "watchlist",
     style: str = "value_dip",
     max_results: int = 15,
 ) -> str:
-    """Screen for high-conviction entry setups and annotate results against your current portfolio.
+    """Screen a set of tickers for entry setups and annotate results against your current portfolio.
 
-    universe: 'sp500' | 'ftse100' | 'both' | 'watchlist' | comma-separated tickers
+    universe: 'watchlist' (your T212 holdings) | comma-separated tickers discovered via search_web
+              Use search_web to find candidates first, then pass them here.
+              Example: "CCJ,UEC,SPUT.TO,DNN.TO" or "SGLN.L,PHAU.L,GLD,IAU,PDBC"
     style:
-      'value_dip'     — low RSI (<40), above MA200, analyst upside >10%  (default)
-      'momentum'      — strong 1M momentum, RSI 50-70, above all MAs
+      'value_dip'     — RSI <40, above MA200, analyst upside >10%  (default)
+      'momentum'      — 1M momentum >3%, RSI 50-70, above all MAs
       'deep_value'    — RSI <30, any MA alignment, upside >20%
-      'quality_growth'— above MA200, low P/E (<25), revenue growth >10%
-      'custom'        — no preset filters (pass individual params via the raw screen_stocks tool)
+      'quality_growth'— above MA200, P/E <25, 1M momentum >2%
+      'custom'        — no preset filters
     max_results: cap results (default 15)
     """
     from tools.analysis import _screen_stocks_core
@@ -667,7 +669,6 @@ async def get_opportunity_context(
     header = [
         f"## Opportunity Screen — {universe.upper()} | Style: {style} | {datetime.now().strftime('%d %b %Y')}",
         "",
-        f"_Profile: medium risk, geopolitical-aware, wealth-preservation first._  ",
         f"_Tickers marked '← HELD' are already in your portfolio._",
         "",
     ]
