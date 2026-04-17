@@ -24,6 +24,10 @@ mcp = app.mcp
 
 _TRADING_DAYS = 252
 
+# Limit concurrent yfinance .info calls — threads are not killed on asyncio
+# cancellation so unbounded parallelism exhausts the thread pool.
+_YF_META_SEM = asyncio.Semaphore(3)
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -206,7 +210,8 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
         def _f():
             return yf.Ticker(ticker).info
         try:
-            info = await asyncio.to_thread(_f)
+            async with _YF_META_SEM:
+                info = await asyncio.wait_for(asyncio.to_thread(_f), timeout=8.0)
             return {
                 "sector": info.get("sector", "Unknown"),
                 "country": info.get("country", "Unknown"),
@@ -261,8 +266,14 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
     )
     lines.append("-" * (col_w + 52))
 
+    data_warnings = []
     for h in holding_rows:
-        ret_s = f"{h['period_ret']:+.1f}%" if h["period_ret"] is not None else "  N/A"
+        ret = h["period_ret"]
+        # Flag returns that look like data artefacts (>±20% in 1m / >±40% in 1q/1y)
+        warn_threshold = 20 if period in ("5d", "1mo") else 40
+        if ret is not None and abs(ret) > warn_threshold:
+            data_warnings.append(f"⚠️  {h['display']} {ret:+.1f}% — verify: may be bad yfinance data")
+        ret_s = f"{ret:+.1f}%{'⚠' if ret is not None and abs(ret) > warn_threshold else ''}" if ret is not None else "  N/A"
         ctr_s = f"{h['contrib']:+.2f}%" if h["contrib"] is not None else "  N/A"
         px_s = f"{h['cur_price']:,.2f}" if h["cur_price"] else "N/A"
         lines.append(
@@ -340,6 +351,8 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
         lines.append(f"- ⚠️  No price history for: {', '.join(no_data)} (check known_tickers.json or resolver)")
     else:
         lines.append(f"- ✅ All {len(holding_rows)} holdings have price history for this period")
+    for w in data_warnings:
+        lines.append(f"- {w}")
 
     return "\n".join(lines)
 
