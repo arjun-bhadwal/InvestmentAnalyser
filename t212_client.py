@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import httpx
 
@@ -10,6 +11,11 @@ class T212Client:
         "live": "https://live.trading212.com/api/v0",
     }
 
+    # Max concurrent in-flight T212 requests across all tools.
+    # T212 allows ~100 req/min; 2 concurrent prevents burst 429s while
+    # still letting get_portfolio + get_account_summary run in parallel.
+    _CONCURRENCY = 2
+
     def __init__(self, api_key: str, api_secret: str, mode: str = "demo"):
         if mode not in self._BASE_URLS:
             raise ValueError(f"T212_MODE must be 'demo' or 'live', got: {mode!r}")
@@ -21,13 +27,14 @@ class T212Client:
             timeout=15.0,
         )
         self.mode = mode
+        self._sem = asyncio.Semaphore(self._CONCURRENCY)
 
     # ── Internal Retry ───────────────────────────────────────────────────────
 
     async def _get_with_retry(self, path: str, params: dict = None) -> httpx.Response:
-        import asyncio
         for attempt in range(4):
-            resp = await self._client.get(path, params=params)
+            async with self._sem:                  # hold lock only for the HTTP call
+                resp = await self._client.get(path, params=params)
             if resp.status_code == 429:
                 if attempt == 3:
                     self._raise_for_status(resp)
@@ -35,9 +42,8 @@ class T212Client:
                     retry_after = int(resp.headers.get("Retry-After", "5"))
                 except ValueError:
                     retry_after = 5
-                # Wait incrementally longer
                 wait_time = max(retry_after, 2 ** attempt)
-                await asyncio.sleep(wait_time)
+                await asyncio.sleep(wait_time)     # sleep outside the lock
             else:
                 self._raise_for_status(resp)
                 return resp
