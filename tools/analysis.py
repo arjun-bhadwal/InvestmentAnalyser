@@ -337,7 +337,7 @@ async def _screen_stocks_core(
     """Scan a set of tickers for entry setups using technical and fundamental filters.
 
     universe: "watchlist" (your T212 holdings) | comma-separated tickers
-              Use search_web to discover candidates first, then pass them here.
+              Use _search_web to discover candidates first, then pass them here.
               Example: "CCJ,UEC,DNN.TO,SPUT.TO" or "SGLN.L,PHAU.L,GLD,IAU"
     max_rsi: only include tickers with RSI below this value
     min_rsi: only include tickers with RSI above this value

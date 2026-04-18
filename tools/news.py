@@ -66,12 +66,11 @@ async def _get_news_core(ticker: str, max_headlines: int = 5) -> str:
     except NameError:
         exchange_hint = ""
     web_query = f"{display}{exchange_hint} news {today.year}"
-    web_result = await search_web(web_query)
+    web_result = await _search_web(web_query)
     return f"⚠️ Finnhub: no coverage for '{finnhub_sym}' — using web search instead.\n\n{web_result}"
 
 
-@mcp.tool()
-async def search_web(query: str) -> str:
+async def _search_web(query: str) -> str:
     """Search the web for financial news, analyst commentary, market chatter, geopolitical events.
     Examples: 'TSLA latest news', 'oil price geopolitical risk 2025'"""
 
@@ -117,7 +116,7 @@ async def search_web(query: str) -> str:
 
 async def _research_perplexity(query: str) -> str:
     """Deep research via Perplexity AI (requires PERPLEXITY_API_KEY in .env).
-    Not exposed — use search_web instead, which requires no API key."""
+    Not exposed — use _search_web instead, which requires no API key."""
 
     if not app.PERPLEXITY_API_KEY:
         return "PERPLEXITY_API_KEY not set. Add it to .env. Get a key at https://www.perplexity.ai/settings/api"

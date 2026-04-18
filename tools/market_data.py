@@ -102,8 +102,21 @@ async def _get_stock_fundamentals(ticker: str) -> str:
     industry = info.get("industry", "N/A")
     currency = info.get("currency", "")
 
+    # Check how many critical fields are populated
+    critical = ["trailingPE", "forwardPE", "trailingEps", "forwardEps",
+                "grossMargins", "profitMargins", "beta", "sector"]
+    missing = [f for f in critical if not info.get(f)]
+    data_warning = ""
+    if len(missing) >= 5:
+        data_warning = (
+            f"⚠️  DATA UNRELIABLE — {len(missing)}/{len(critical)} critical fields missing "
+            f"({', '.join(missing)}). yFinance may be throttling or this instrument "
+            f"has no coverage. Cross-check before trading.\n\n"
+        )
+
     return (
         f"**{name} ({ticker.upper()}) — Fundamentals**\n\n"
+        f"{data_warning}"
         f"**Valuation**\n"
         f"- Market cap:      {_val('marketCap', 'B')}\n"
         f"- P/E (trailing):  {_val('trailingPE')}\n"
@@ -149,7 +162,9 @@ async def _get_analyst_ratings(ticker: str) -> str:
         return info, upgrades
 
     try:
-        info, upgrades = await asyncio.to_thread(_fetch)
+        from helpers import YF_INFO_SEM
+        async with YF_INFO_SEM:
+            info, upgrades = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=12.0)
     except Exception as e:
         return f"Error fetching analyst data for {ticker}: {e}"
 
@@ -674,3 +689,71 @@ async def get_fundamentals(tickers: str, section: str = "overview") -> str:
     else:
         return await _get_stock_fundamentals(t)
 
+
+
+@mcp.tool()
+async def get_price_history(tickers: str, period: str = "5y", interval: str = "1mo") -> str:
+    """Return OHLCV price history for one or more tickers.
+
+    Use for regime analysis, scenario modelling, and drawdown mapping.
+
+    tickers:  comma-separated symbols (e.g. 'AAPL, SPY'). Max 5.
+    period:   '1mo' | '3mo' | '6mo' | '1y' | '2y' | '5y' | '10y' | 'max'
+    interval: '1d' | '1wk' | '1mo'  (use '1mo' for long regimes, '1d' for short-term)
+    """
+    from resolver import aresolve
+    syms = [t.strip().upper() for t in tickers.split(",") if t.strip()][:5]
+    if not syms:
+        return "Provide at least one ticker."
+
+    lines = [f"**Price History | Period: {period} | Interval: {interval}**\n"]
+
+    for raw in syms:
+        try:
+            rt = await aresolve(raw)
+            def _fetch(sym=rt.yf_symbol, p=period, iv=interval):
+                return yf.Ticker(sym).history(period=p, interval=iv, auto_adjust=True)
+
+            df = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=15.0)
+            if df.empty:
+                lines.append(f"**{raw}**: no data returned.\n")
+                continue
+
+            close = df["Close"] * rt.unit_scale
+            ret_total = (close.iloc[-1] / close.iloc[0] - 1) * 100
+            peak = close.max()
+            trough_after_peak = close[close.index >= close.idxmax()].min()
+            max_dd = (trough_after_peak / peak - 1) * 100
+
+            lines.append(f"**{raw}** ({rt.yf_symbol}) | {rt.currency} | {len(close)} bars")
+            lines.append(f"- Range:        {close.index[0].date()} → {close.index[-1].date()}")
+            lines.append(f"- Total return: {ret_total:+.1f}%")
+            lines.append(f"- Max drawdown: {max_dd:.1f}%")
+            lines.append(f"- First close:  {close.iloc[0]:,.4f}")
+            lines.append(f"- Last close:   {close.iloc[-1]:,.4f}")
+            lines.append(f"- Peak:         {peak:,.4f}  |  Trough post-peak: {trough_after_peak:,.4f}")
+            lines.append("")
+
+            # OHLCV table (capped at 60 rows to keep response manageable)
+            df_out = df.copy()
+            df_out["Close"] = df_out["Close"] * rt.unit_scale
+            df_out["Open"]  = df_out["Open"]  * rt.unit_scale
+            df_out["High"]  = df_out["High"]  * rt.unit_scale
+            df_out["Low"]   = df_out["Low"]   * rt.unit_scale
+            sample = df_out.tail(60) if len(df_out) > 60 else df_out
+            if len(df_out) > 60:
+                lines.append(f"_(showing last 60 of {len(df_out)} bars)_")
+            lines.append(f"{'Date':<12} {'Open':>10} {'High':>10} {'Low':>10} {'Close':>10} {'Volume':>14}")
+            lines.append("-" * 60)
+            for dt, row in sample.iterrows():
+                date_s = str(dt.date()) if hasattr(dt, 'date') else str(dt)[:10]
+                lines.append(
+                    f"{date_s:<12} {row['Open']:>10.4f} {row['High']:>10.4f} "
+                    f"{row['Low']:>10.4f} {row['Close']:>10.4f} {int(row.get('Volume', 0)):>14,}"
+                )
+            lines.append("")
+
+        except Exception as e:
+            lines.append(f"**{raw}**: error — {e}\n")
+
+    return "\n".join(lines)
