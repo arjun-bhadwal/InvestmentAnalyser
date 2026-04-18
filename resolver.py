@@ -273,20 +273,20 @@ def _probe_sync(symbol: str) -> bool:
 
 
 def _detect_unit_scale(symbol: str) -> tuple[float, str]:
-    """For LSE tickers, determine whether yfinance prices are GBX (pence).
-    Returns (scale, currency). GBX → (0.01, 'GBP'). All others → (1.0, currency)."""
+    """Probe yfinance fast_info for the actual listing currency and unit scale.
+
+    For LSE (.L) tickers also applies GBX→GBP pence detection.
+    Returns (scale, currency_iso4217). Falls back to _SUFFIX_CURRENCY hint on error.
+
+    yfinance pence variants: "GBX" (uppercase) or "GBp" (mixed-case) — both handled.
+    T212 pence variant: "GBX" (handled separately in helpers.position_value).
+    """
     if symbol in _unit_scale_cache:
         return _unit_scale_cache[symbol]
 
     suffix = "." + symbol.split(".", 1)[1] if "." in symbol else ""
     hint_ccy = _SUFFIX_CURRENCY.get(suffix, "USD")
 
-    if suffix != ".L":
-        result = (1.0, hint_ccy)
-        _unit_scale_cache[symbol] = result
-        return result
-
-    # LSE: check fast_info for currency + magnitude heuristic
     try:
         fi = yf.Ticker(symbol).fast_info
         cur_raw = getattr(fi, "currency", "") or ""
@@ -294,16 +294,27 @@ def _detect_unit_scale(symbol: str) -> tuple[float, str]:
         last = getattr(fi, "last_price", None)
         last_f = float(last) if last is not None else 0.0
 
-        if cur_u == "GBX" or cur_raw == "GBp":
-            result = (0.01, "GBP")
-        elif cur_u == "GBP" and last_f > 1000:
-            # Yahoo mislabels some GBX-quoted ETFs as GBP (SGLN.L etc).
-            # Genuine GBP equities trade < £500; values > £1000 are pence.
-            result = (0.01, "GBP")
+        if suffix == ".L":
+            # LSE: detect GBX (pence) pricing — yfinance uses "GBX" or "GBp"
+            if cur_u == "GBX" or cur_raw == "GBp":
+                result = (0.01, "GBP")
+            elif cur_u == "GBP" and last_f > 1000:
+                # Yahoo mislabels some GBX-quoted ETFs as GBP (SGLN.L etc).
+                # Genuine GBP equities trade < £500; values > £1000 are pence.
+                result = (0.01, "GBP")
+            elif cur_u and cur_u not in ("GBX", "GBP"):
+                # LSE-listed but priced in a foreign currency (e.g. COPX.L = USD)
+                result = (1.0, cur_u)
+            else:
+                result = (1.0, "GBP")
         else:
-            result = (1.0, "GBP")
+            # Non-LSE: trust yfinance currency when available; suffix map is the fallback
+            if cur_u and cur_u != "GBX":
+                result = (1.0, cur_u)
+            else:
+                result = (1.0, hint_ccy)
     except Exception:
-        result = (1.0, "GBP")
+        result = (1.0, hint_ccy)
 
     _unit_scale_cache[symbol] = result
     return result
@@ -337,7 +348,9 @@ def resolve(raw: str, *, probe: bool = True) -> ResolvedTicker:
 
     suffix = "." + chosen.split(".", 1)[1] if "." in chosen else ""
     currency, scale = (_SUFFIX_CURRENCY.get(suffix, "USD"), 1.0)
-    if suffix == ".L" and probe:
+    if suffix and probe:
+        # Probe actual currency for all non-US tickers; handles LSE foreign-currency
+        # stocks (e.g. COPX.L = USD) and alternative-ticker resolution (LYI.DE→LYI.F)
         scale, currency = _detect_unit_scale(chosen)
     exchange = _SUFFIX_EXCHANGE.get(suffix, "NYSE/NASDAQ" if not suffix else "")
 
