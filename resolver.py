@@ -438,7 +438,9 @@ async def fetch_fundamental_dict(raw: str) -> tuple[ResolvedTicker, dict]:
             
         return info
 
-    info = await asyncio.to_thread(_fetch)
+    from helpers import YF_INFO_SEM
+    async with YF_INFO_SEM:
+        info = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=12.0)
     return rt, info
 
 

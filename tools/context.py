@@ -86,7 +86,6 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
     from resolver import fetch_historic_prices_scaled, bulk_resolve
     from tools.market_data import _get_market_snapshot
     from tools.macro import _get_fear_greed_index
-    from tools.news import _get_news_core
 
     period = _yf_period(horizon)
     hl = _period_label(horizon)
@@ -205,33 +204,7 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
                 "max_dd": max_dd, "beta": beta,
             }
 
-    # ── 7. Allocation breakdown (concurrent yf.info per holding) ─────────────
-    async def _meta(ticker: str) -> dict:
-        def _f():
-            return yf.Ticker(ticker).info
-        try:
-            async with _YF_META_SEM:
-                info = await asyncio.wait_for(asyncio.to_thread(_f), timeout=8.0)
-            return {
-                "sector": info.get("sector", "Unknown"),
-                "country": info.get("country", "Unknown"),
-                "marketCap": float(info.get("marketCap", 0) or 0),
-            }
-        except Exception:
-            return {"sector": "Unknown", "country": "Unknown", "marketCap": 0}
-
-    metas = await asyncio.gather(*[_meta(h["display"]) for h in holding_rows])
-    for h, m in zip(holding_rows, metas):
-        h.update(m)
-
-    # ── 8. Top-5 headlines (concurrent, 2 per ticker) ─────────────────────────
-    top5 = [h["raw"] for h in holding_rows[:5]]
-    news_results = await asyncio.gather(
-        *[_get_news_core(t, max_headlines=2) for t in top5],
-        return_exceptions=True,
-    )
-
-    # ── Compose output ─────────────────────────────────────────────────────────
+    # ── 7. Compose output ────────────────────────────────────────────────────
     lines: list[str] = [f"## Portfolio Snapshot — {now_str} ({app.T212_MODE.upper()})\n"]
 
     # Account summary bar
@@ -262,25 +235,20 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
     lines.append(f"### Holdings — {hl} View\n")
     col_w = max(len(h["display"]) for h in holding_rows) + 2
     lines.append(
-        f"{'Ticker':<{col_w}} {'Wgt%':>6} {'Price':>10}  {hl + ' Ret':>10}  {'Contrib%':>9}  {'Trend':>5}  {'CCY'}"
+        f"{'Ticker':<{col_w}} {'Wgt%':>6} {'Price':>10}  {hl + ' Ret':>10}  {'P&L':>10}  {'Trend':>5}  {'CCY'}"
     )
     lines.append("-" * (col_w + 52))
 
-    data_warnings = []
     for h in holding_rows:
         ret = h["period_ret"]
-        # Flag returns that look like data artefacts (>±20% in 1m / >±40% in 1q/1y)
-        warn_threshold = 20 if period in ("5d", "1mo") else 40
-        if ret is not None and abs(ret) > warn_threshold:
-            data_warnings.append(f"⚠️  {h['display']} {ret:+.1f}% — verify: may be bad yfinance data")
-        ret_s = f"{ret:+.1f}%{'⚠' if ret is not None and abs(ret) > warn_threshold else ''}" if ret is not None else "  N/A"
-        ctr_s = f"{h['contrib']:+.2f}%" if h["contrib"] is not None else "  N/A"
-        px_s = f"{h['cur_price']:,.2f}" if h["cur_price"] else "N/A"
+        ret_s = f"{ret:+.1f}%" if ret is not None else "  N/A"
+        ppl_s = f"{h['ppl']:+,.2f}" if h["ppl"] is not None else "  N/A"
+        px_s  = f"{h['cur_price']:,.2f}" if h["cur_price"] else "N/A"
         lines.append(
-            f"{h['display']:<{col_w}} {h['wgt']:>5.1f}% {px_s:>10}  {ret_s:>10}  {ctr_s:>9}  {h['trend']:>5}  {h['currency']}"
+            f"{h['display']:<{col_w}} {h['wgt']:>5.1f}% {px_s:>10}  {ret_s:>10}  {ppl_s:>10}  {h['trend']:>5}  {h['currency']}"
         )
 
-    # Portfolio summary metrics
+    # Portfolio risk metrics
     if port_metrics:
         lines.append("")
         lines.append(f"### Portfolio Metrics ({hl})")
@@ -296,27 +264,7 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
             f"|  Beta (SPY): {beta_s}"
         )
 
-    # Allocation
-    lines.append("")
-    lines.append("### Allocation")
-
-    def _bucket_table(label: str, key: str) -> list[str]:
-        buckets: dict[str, float] = {}
-        for h in holding_rows:
-            k = h.get(key, "Unknown") or "Unknown"
-            buckets[k] = buckets.get(k, 0.0) + weights_raw.get(h["raw"], 0.0)
-        out = [f"**{label}**"]
-        for name, val in sorted(buckets.items(), key=lambda x: x[1], reverse=True):
-            w = val / total_portfolio_val * 100
-            bar = "█" * max(1, int(w / 4))
-            out.append(f"  {name:<22} {w:>5.1f}%  {bar}")
-        return out
-
-    lines += _bucket_table("Sector", "sector")
-    lines.append("")
-    lines += _bucket_table("Geography", "country")
-
-    # Concentration
+    # Concentration (weight-based, no external calls needed)
     wts_list = [weights_raw.get(h["raw"], 0) / total_portfolio_val for h in holding_rows]
     hhi = sum(w ** 2 for w in wts_list)
     top5_w = sum(sorted(wts_list, reverse=True)[:5]) * 100
@@ -326,33 +274,12 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
     if top5_w > 70:
         lines.append(f"⚠️  Top-5 weight {top5_w:.0f}% — consider diversifying")
 
-    # Top-5 headlines
-    lines.append("")
-    lines.append("### Recent Headlines (Top 5 by Weight)")
-    for ticker_raw, result in zip(top5, news_results):
-        display_name = resolutions.get(ticker_raw, type("", (), {"yf_symbol": ticker_raw})()).yf_symbol \
-            if resolutions.get(ticker_raw) else ticker_raw
-        if isinstance(result, Exception):
-            lines.append(f"\n**{display_name}:** (unavailable — {result})")
-            continue
-        headlines = [ln for ln in result.split("\n") if ln.startswith("- [")][:2]
-        if headlines:
-            lines.append(f"\n**{display_name}:**")
-            lines.extend(headlines)
-        else:
-            lines.append(f"\n**{display_name}:** No headlines in the past 7 days.")
-
-    # Data integrity footer
+    # Data footer
     lines.append("")
     no_data = [h["display"] for h in holding_rows if h["period_ret"] is None]
-    lines.append("### Data")
-    lines.append(f"- Price source: yFinance  |  Period: {period}  |  As of: {now_str}")
+    lines.append(f"_Price source: yFinance  |  Period: {period}  |  As of: {now_str}_")
     if no_data:
-        lines.append(f"- ⚠️  No price history for: {', '.join(no_data)} (check known_tickers.json or resolver)")
-    else:
-        lines.append(f"- ✅ All {len(holding_rows)} holdings have price history for this period")
-    for w in data_warnings:
-        lines.append(f"- {w}")
+        lines.append(f"_⚠️  No price history for: {', '.join(no_data)}_")
 
     return "\n".join(lines)
 
@@ -621,8 +548,8 @@ async def get_opportunity_context(
 ) -> str:
     """Screen a set of tickers for entry setups and annotate results against your current portfolio.
 
-    universe: 'watchlist' (your T212 holdings) | comma-separated tickers discovered via search_web
-              Use search_web to find candidates first, then pass them here.
+    universe: 'watchlist' (your T212 holdings) | comma-separated tickers discovered via _search_web
+              Use _search_web to find candidates first, then pass them here.
               Example: "CCJ,UEC,SPUT.TO,DNN.TO" or "SGLN.L,PHAU.L,GLD,IAU,PDBC"
     style:
       'value_dip'     — RSI <40, above MA200, analyst upside >10%  (default)

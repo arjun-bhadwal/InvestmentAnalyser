@@ -1,10 +1,19 @@
 """
 Shared helpers: caching, formatting, ticker conversion.
 """
+import asyncio
 import hashlib
 from functools import wraps
 
 from cachetools import TTLCache
+
+# ---------------------------------------------------------------------------
+# Global yfinance concurrency gate
+# ---------------------------------------------------------------------------
+# yfinance .info calls are slow (~0.3–1s each) and Yahoo throttles under
+# burst load by returning partial/empty dicts with no error. Cap concurrent
+# .info fetches across ALL tools so the thread pool never saturates.
+YF_INFO_SEM = asyncio.Semaphore(4)
 
 # ---------------------------------------------------------------------------
 # Caching — avoids repeated expensive API calls within TTL windows

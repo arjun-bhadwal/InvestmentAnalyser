@@ -10,7 +10,7 @@ Layer 2 — Drill-downs (explicit deep-dives):
   macro.get_macro_summary
   analysis.get_earnings_calendar
   portfolio.get_account_history, get_open_orders, get_pies
-  news.search_web, research
+  news._search_web, research
 
 Layer 3 — Internal helpers (prefix _):
   All demoted single-purpose tools — called only from bundles/drill-downs.
