@@ -343,14 +343,16 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
         except Exception:
             return {}
 
+    info = await _fetch_info()
+    company_name = (info.get("longName") or info.get("shortName") or "").strip() or None
+
     base_tasks = [
         fetch_history(ticker, period="1y", interval="1d"),
-        _fetch_info(),
         _get_analyst_ratings(sym),
-        _get_news_core(ticker, max_headlines=5),
+        _get_news_core(ticker, max_headlines=5, company_name=company_name),
     ]
 
-    (rt_h, hist_df), info, ratings_str, news_str = await asyncio.gather(*base_tasks)
+    (rt_h, hist_df), ratings_str, news_str = await asyncio.gather(*base_tasks)
 
     # ── Deep drill-downs (optional) ──────────────────────────────────────────
     dcf_str = stmts_str = insider_str = None
@@ -527,7 +529,7 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
     # News
     lines.append("### Recent Headlines")
     for ln in news_str.split("\n"):
-        if ln.startswith("- ["):
+        if ln.strip():
             lines.append(ln)
 
     lines.append("")

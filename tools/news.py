@@ -14,7 +14,7 @@ from helpers import finnhub_retry
 mcp = app.mcp
 
 
-async def _get_news_core(ticker: str, max_headlines: int = 5) -> str:
+async def _get_news_core(ticker: str, max_headlines: int = 5, company_name: str | None = None) -> str:
     """Return recent news headlines for a stock ticker.
 
     Tries Finnhub first (good for US equities). On empty results — including
@@ -65,7 +65,8 @@ async def _get_news_core(ticker: str, max_headlines: int = 5) -> str:
         exchange_hint = f" {rt.exchange}" if rt.exchange else ""
     except NameError:
         exchange_hint = ""
-    web_query = f"{display}{exchange_hint} news {today.year}"
+    parts = [p for p in [display, company_name] if p and p.strip()]
+    web_query = f"{' '.join(parts)}{exchange_hint} news {today.year}"
     web_result = await _search_web(web_query)
     return f"⚠️ Finnhub: no coverage for '{finnhub_sym}' — using web search instead.\n\n{web_result}"
 
