@@ -28,8 +28,8 @@ async def _get_portfolio_core() -> str:
 
     lines = [
         f"**Trading 212 Portfolio ({app.T212_MODE.upper()})**\n",
-        f"{'Ticker':<10} {'Qty':>10} {'Avg Price':>12} {'Current':>12} {'P&L':>12}",
-        "-" * 58,
+        f"{'Ticker':<10} {'Qty':>10} {'Avg Price':>12} {'Current':>12} {'P&L':>12} {'Ccy':>4}",
+        "-" * 64,
     ]
     for pos in positions:
         ticker = strip_t212_ticker(pos.get("ticker", "?"))
@@ -38,11 +38,12 @@ async def _get_portfolio_core() -> str:
         cur = fmt_float(pos.get("currentPrice"))
         ppl = pos.get("ppl", 0)
         ppl_str = f"{float(ppl):+,.2f}" if ppl is not None else "N/A"
-        lines.append(f"{ticker:<10} {qty:>10} {avg:>12} {cur:>12} {ppl_str:>12}")
+        ccy = str(pos.get("currencyCode", "") or pos.get("currency", "") or "").upper()
+        lines.append(f"{ticker:<10} {qty:>10} {avg:>12} {cur:>12} {ppl_str:>12} {ccy:>4}")
 
     total_ppl = sum(float(p.get("ppl", 0) or 0) for p in positions)
-    lines.append("-" * 58)
-    lines.append(f"{'Total P&L':<46} {total_ppl:>+,.2f}")
+    lines.append("-" * 64)
+    lines.append(f"{'Total P&L':<52} {total_ppl:>+,.2f}")
     return "\n".join(lines)
 
 
