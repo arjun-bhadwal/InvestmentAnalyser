@@ -343,16 +343,13 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
         except Exception:
             return {}
 
-    info = await _fetch_info()
-    company_name = (info.get("longName") or info.get("shortName") or "").strip() or None
-
-    base_tasks = [
+    info, (rt_h, hist_df), ratings_str = await asyncio.gather(
+        _fetch_info(),
         fetch_history(ticker, period="1y", interval="1d"),
         _get_analyst_ratings(sym),
-        _get_news_core(ticker, max_headlines=5, company_name=company_name),
-    ]
-
-    (rt_h, hist_df), ratings_str, news_str = await asyncio.gather(*base_tasks)
+    )
+    company_name = (info.get("longName") or info.get("shortName") or "").strip() or None
+    news_str = await _get_news_core(ticker, max_headlines=5, company_name=company_name)
 
     # ── Deep drill-downs (optional) ──────────────────────────────────────────
     dcf_str = stmts_str = insider_str = None
