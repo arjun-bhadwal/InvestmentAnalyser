@@ -348,9 +348,7 @@ def resolve(raw: str, *, probe: bool = True) -> ResolvedTicker:
 
     suffix = "." + chosen.split(".", 1)[1] if "." in chosen else ""
     currency, scale = (_SUFFIX_CURRENCY.get(suffix, "USD"), 1.0)
-    if suffix and probe:
-        # Probe actual currency for all non-US tickers; handles LSE foreign-currency
-        # stocks (e.g. COPX.L = USD) and alternative-ticker resolution (LYI.DE→LYI.F)
+    if suffix == ".L" and probe:
         scale, currency = _detect_unit_scale(chosen)
     exchange = _SUFFIX_EXCHANGE.get(suffix, "NYSE/NASDAQ" if not suffix else "")
 
