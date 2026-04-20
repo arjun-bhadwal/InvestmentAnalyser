@@ -68,6 +68,86 @@ def _ma_signal(price: float, ma20: float | None, ma50: float | None, ma200: floa
     return " ".join(parts) if parts else "N/A"
 
 
+def _compute_portfolio_metrics(
+    price_df: pd.DataFrame,
+    weights: dict[str, float],
+    benchmark: pd.Series | None = None,
+    rf_annual: float = 0.045,
+) -> dict:
+    """
+    Production-grade portfolio analytics.
+    price_df: Columns = tickers, index = datetime, values = prices
+    weights: {ticker: portfolio weight} (must sum ~1)
+    """
+    # 1. Clean + align data
+    price_df = price_df.sort_index().ffill().dropna(how="all")
+    common_cols = [c for c in price_df.columns if c in weights]
+    price_df = price_df[common_cols]
+
+    if len(price_df) < 5:
+        return {}
+
+    # 2. Compute returns
+    returns = price_df.pct_change().dropna()
+    w = np.array([weights[c] for c in returns.columns])
+    port_ret = returns.dot(w)
+
+    # 3. Geometric cumulative return
+    cum = (1 + port_ret).cumprod()
+    total_return = cum.iloc[-1] - 1
+    ann_return = (cum.iloc[-1]) ** (_TRADING_DAYS / len(cum)) - 1
+
+    # 4. Risk metrics
+    ann_vol = port_ret.std(ddof=1) * np.sqrt(_TRADING_DAYS)
+    rf_daily = rf_annual / _TRADING_DAYS
+    excess_ret = port_ret - rf_daily
+
+    # Sharpe
+    sharpe = (excess_ret.mean() / port_ret.std(ddof=1)) * np.sqrt(_TRADING_DAYS) if port_ret.std(ddof=1) > 0 else 0.0
+
+    # Sortino (downside deviation)
+    downside = port_ret[port_ret < 0]
+    downside_std = downside.std(ddof=1)
+    sortino = (excess_ret.mean() / downside_std) * np.sqrt(_TRADING_DAYS) if downside_std and downside_std > 0 else 0.0
+
+    # Max Drawdown
+    rolling_max = cum.cummax()
+    drawdown = cum / rolling_max - 1
+    max_dd = drawdown.min()
+
+    # Calmar ratio
+    calmar = ann_return / abs(max_dd) if max_dd < 0 else 0.0
+
+    # 5. Benchmark-relative metrics
+    beta = alpha = None
+    if benchmark is not None:
+        bench = benchmark.sort_index().ffill().pct_change().dropna()
+        aligned = pd.concat([port_ret, bench], axis=1).dropna()
+        aligned.columns = ["port", "bench"]
+
+        if len(aligned) >= 10:
+            cov = np.cov(aligned["port"], aligned["bench"], ddof=1)
+            var_b = cov[1, 1]
+            if var_b > 0:
+                beta = cov[0, 1] / var_b
+                # Jensen's alpha (annualised)
+                bench_ann = (1 + aligned["bench"]).prod() ** (_TRADING_DAYS / len(aligned)) - 1
+                alpha = ann_return - (rf_annual + beta * (bench_ann - rf_annual))
+
+    return {
+        "total_return_pct": total_return * 100,
+        "annual_return_pct": ann_return * 100,
+        "annual_vol_pct": ann_vol * 100,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "max_drawdown_pct": max_dd * 100,
+        "calmar": calmar,
+        "beta": beta,
+        "alpha": alpha * 100 if alpha is not None else None,
+        "observations": len(port_ret),
+    }
+
+
 # ===========================================================================
 # 1. PORTFOLIO CONTEXT BUNDLE
 # ===========================================================================
@@ -120,10 +200,21 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
 
     # ── 4. Account summary values ─────────────────────────────────────────────
     currency = acct.get("currency", "")
+    ccy_sym = {"GBP": "£", "USD": "$", "EUR": "€"}.get(currency, f"{currency} ")
+    
     total_val = float(acct.get("totalValue", 0) or 0)
-    free_cash = float((acct.get("cash") or {}).get("availableToTrade", 0) or 0)
-    invested = float((acct.get("investments") or {}).get("totalCost", 0) or 0)
+    
+    cash_obj = acct.get("cash", {})
+    total_cash = (
+        float(cash_obj.get("availableToTrade", 0) or 0) +
+        float(cash_obj.get("reservedForOrders", 0) or 0) +
+        float(cash_obj.get("inPies", 0) or 0)
+    )
+    
+    current_value = total_val - total_cash
+
     unreal_pnl = float((acct.get("investments") or {}).get("unrealizedProfitLoss", 0) or 0)
+    real_pnl = float((acct.get("investments") or {}).get("realizedProfitLoss", 0) or 0)
 
     # ── 5. Per-holding stats ──────────────────────────────────────────────────
     holding_rows = []
@@ -137,7 +228,16 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
         unit_scale = rt.unit_scale if rt else 1.0
         cur_price_raw = safe_float(pos.get("currentPrice"))
         cur_price = cur_price_raw * unit_scale if cur_price_raw is not None else None
+        
+        # ── Personal metrics from T212 ────────────────────────────────────────
+        pos_val_base = position_value(pos)
         ppl = safe_float(pos.get("ppl"))
+        fx_ppl = safe_float(pos.get("fxPpl"), fallback=0.0)
+        
+        # Calculate derived cost in base currency
+        cost_base = pos_val_base - ppl
+        total_ret_pct = (ppl / cost_base * 100) if cost_base > 0 else 0.0
+        fx_ret_pct = (fx_ppl / cost_base * 100) if cost_base > 0 else 0.0
 
         # Period return from the single downloaded frame
         period_ret: float | None = None
@@ -153,67 +253,50 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
 
         holding_rows.append({
             "raw": raw, "display": yf_sym, "currency": ccy,
-            "wgt": wgt, "cur_price": cur_price, "ppl": ppl,
-            "period_ret": period_ret, "contrib": contrib, "trend": trend,
+            "ccy_sym": {"GBP": "£", "USD": "$", "EUR": "€"}.get(ccy, f"{ccy} "),
+            "wgt": wgt, "cur_price": cur_price, "ppl": ppl, "fx_ppl": fx_ppl,
+            "period_ret": period_ret, "total_ret_pct": total_ret_pct, "fx_ret_pct": fx_ret_pct,
+            "contrib": contrib, "trend": trend,
         })
 
     holding_rows.sort(key=lambda x: x["wgt"], reverse=True)
 
     # ── 6. Portfolio-level risk metrics ───────────────────────────────────────
     port_metrics: dict = {}
-    available_raw = [
-        h["raw"] for h in holding_rows
-        if resolutions.get(h["raw"]) and
-           resolutions[h["raw"]].yf_symbol in closes.columns and
-           closes[resolutions[h["raw"]].yf_symbol].dropna().shape[0] >= 5
-    ]
+    if not closes.empty:
+        # Align weights with closes columns (yf_symbols)
+        yf_weights = {}
+        for raw, w in weights.items():
+            rt = resolutions.get(raw)
+            if rt and rt.yf_symbol in closes.columns:
+                yf_weights[rt.yf_symbol] = w
 
-    if available_raw and not closes.empty:
-        rets_frame = pd.DataFrame()
-        for raw in available_raw:
-            rt = resolutions[raw]
-            if rt.yf_symbol in closes.columns:
-                rets_frame[raw] = closes[rt.yf_symbol].pct_change()
+        benchmark_series = None
+        spy_rt = resolutions.get("SPY")
+        if spy_rt and spy_rt.yf_symbol in closes.columns:
+            benchmark_series = closes[spy_rt.yf_symbol]
 
-        rets_frame = rets_frame.replace([np.inf, -np.inf], np.nan).dropna(how="all")
-        port_ret_series = sum(
-            rets_frame[r] * weights.get(r, 0) for r in available_raw if r in rets_frame.columns
-        ).dropna()
+        port_metrics = _compute_portfolio_metrics(
+            price_df=closes,
+            weights=yf_weights,
+            benchmark=benchmark_series,
+            rf_annual=0.045
+        )
 
-        if len(port_ret_series) >= 5:
-            ann_factor = _TRADING_DAYS / len(port_ret_series) * len(port_ret_series)
-            ann_ret = float(port_ret_series.mean()) * _TRADING_DAYS * 100
-            ann_vol = float(port_ret_series.std()) * np.sqrt(_TRADING_DAYS) * 100
-            sharpe = (ann_ret / 100 - 0.045) / (ann_vol / 100) if ann_vol > 0 else 0.0
-            cum = (1 + port_ret_series).cumprod()
-            max_dd = float(((cum / cum.cummax()) - 1).min()) * 100
-            period_total = float(cum.iloc[-1] - 1) * 100
-
-            beta: float | None = None
-            spy_rt = resolutions.get("SPY")
-            if spy_rt and spy_rt.yf_symbol in closes.columns:
-                spy_rets = closes[spy_rt.yf_symbol].pct_change().replace([np.inf, -np.inf], np.nan)
-                aligned = pd.concat([port_ret_series, spy_rets], axis=1, keys=["port", "SPY"]).dropna()
-                if len(aligned) >= 10:
-                    cov = np.cov(aligned["port"].values, aligned["SPY"].values)
-                    beta = cov[0][1] / cov[1][1] if cov[1][1] != 0 else None
-
-            port_metrics = {
-                "period_total": period_total, "ann_ret": ann_ret,
-                "ann_vol": ann_vol, "sharpe": sharpe,
-                "max_dd": max_dd, "beta": beta,
-            }
 
     # ── 7. Compose output ────────────────────────────────────────────────────
-    lines: list[str] = [f"## Portfolio Snapshot — {now_str} ({app.T212_MODE.upper()})\n"]
+    lines: list[str] = [f"## Portfolio Analysis — {now_str} ({app.T212_MODE.upper()})\n"]
 
-    # Account summary bar
-    pnl_sign = "+" if unreal_pnl >= 0 else ""
+    # Professional Summary Bar
     lines.append(
-        f"**{currency} {total_val:,.2f}** total  |  "
-        f"Cash: {currency} {free_cash:,.2f}  |  "
-        f"Invested: {currency} {invested:,.2f}  |  "
-        f"Unrealised P&L: {pnl_sign}{unreal_pnl:,.2f}"
+        f"**Account Value:** {ccy_sym}{total_val:,.2f}\n"
+    )
+    
+    lines.append(
+        f"**Cash:** {ccy_sym}{total_cash:,.2f}  |  "
+        f"**Current Value:** {ccy_sym}{current_value:,.2f}  |  "
+        f"**Unrealised P&L:** {ccy_sym}{unreal_pnl:,.2f}  |  "
+        f"**Realised P&L:** {ccy_sym}{real_pnl:,.2f}"
     )
 
     # Market + sentiment inline
@@ -235,17 +318,28 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
     lines.append(f"### Holdings — {hl} View\n")
     col_w = max(len(h["display"]) for h in holding_rows) + 2
     lines.append(
-        f"{'Ticker':<{col_w}} {'Wgt%':>6} {'Price':>10}  {hl + ' Ret':>10}  {'P&L':>10}  {'Trend':>5}  {'CCY'}"
+        f"{'Ticker':<{col_w}} {'Wgt%':>6} {'Price':>12}  {'Period Δ':>10}  {'Total P&L (%)':>22}  {'FX (Abs/%)':>18}"
     )
-    lines.append("-" * (col_w + 52))
+    lines.append("-" * (col_w + 72))
 
     for h in holding_rows:
         ret = h["period_ret"]
         ret_s = f"{ret:+.1f}%" if ret is not None else "  N/A"
-        ppl_s = f"{h['ppl']:+,.2f}" if h["ppl"] is not None else "  N/A"
-        px_s  = f"{h['cur_price']:,.2f}" if h["cur_price"] else "N/A"
+        
+        tot_ret = h["total_ret_pct"]
+        pnl_val = h["ppl"]
+        pnl_sign = "+" if pnl_val >= 0 else "-"
+        ppl_s = f"{pnl_sign}{ccy_sym}{abs(pnl_val):,.2f}"
+        merged_pnl = f"{ppl_s} ({tot_ret:+.1f}%)"
+        
+        fx_val = h["fx_ppl"]
+        fx_sign = "+" if fx_val >= 0 else "-"
+        fx_s = f"{fx_sign}{ccy_sym}{abs(fx_val):,.2f} ({h['fx_ret_pct']:+.1f}%)"
+        
+        px_s  = f"{h['ccy_sym']}{h['cur_price']:,.2f}" if h["cur_price"] else "N/A"
+        
         lines.append(
-            f"{h['display']:<{col_w}} {h['wgt']:>5.1f}% {px_s:>10}  {ret_s:>10}  {ppl_s:>10}  {h['trend']:>5}  {h['currency']}"
+            f"{h['display']:<{col_w}} {h['wgt']:>5.1f}% {px_s:>12}  {ret_s:>10}  {merged_pnl:>22}  {fx_s:>18}"
         )
 
     # Portfolio risk metrics
@@ -253,16 +347,25 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
         lines.append("")
         lines.append(f"### Portfolio Metrics ({hl})")
         lines.append(
-            f"- Period return:  {port_metrics['period_total']:+.2f}%  "
-            f"|  Ann. return: {port_metrics['ann_ret']:+.2f}%  "
-            f"|  Ann. vol: {port_metrics['ann_vol']:.2f}%"
+            f"- Total return:  {port_metrics['total_return_pct']:+.2f}%  "
+            f"|  Ann. return: {port_metrics['annual_return_pct']:+.2f}%  "
+            f"|  Ann. vol: {port_metrics['annual_vol_pct']:.2f}%"
         )
+        
         beta_s = f"{port_metrics['beta']:.2f}" if port_metrics.get("beta") is not None else "N/A"
+        alpha_s = f"{port_metrics['alpha']:+.2f}%" if port_metrics.get("alpha") is not None else "N/A"
+        
         lines.append(
             f"- Sharpe: {port_metrics['sharpe']:.2f}  "
-            f"|  Max DD: {port_metrics['max_dd']:.2f}%  "
-            f"|  Beta (SPY): {beta_s}"
+            f"|  Sortino: {port_metrics['sortino']:.2f}  "
+            f"|  Calmar: {port_metrics['calmar']:.2f}"
         )
+        lines.append(
+            f"- Max DD: {port_metrics['max_drawdown_pct']:+.2f}%  "
+            f"|  Beta (SPY): {beta_s}  "
+            f"|  Alpha (Ann): {alpha_s}"
+        )
+
 
     # Concentration (weight-based, no external calls needed)
     wts_list = [weights_raw.get(h["raw"], 0) / total_portfolio_val for h in holding_rows]
