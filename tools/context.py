@@ -15,6 +15,7 @@ import pandas as pd
 import yfinance as yf
 
 import app
+import quant
 from helpers import (
     strip_t212_ticker, position_value, safe_float,
     cached, cache_prices, cache_fundamentals,
@@ -74,78 +75,70 @@ def _compute_portfolio_metrics(
     benchmark: pd.Series | None = None,
     rf_annual: float = 0.045,
 ) -> dict:
-    """
-    Production-grade portfolio analytics.
-    price_df: Columns = tickers, index = datetime, values = prices
-    weights: {ticker: portfolio weight} (must sum ~1)
-    """
-    # 1. Clean + align data
-    price_df = price_df.sort_index().ffill().dropna(how="all")
-    common_cols = [c for c in price_df.columns if c in weights]
-    price_df = price_df[common_cols]
+    """Portfolio analytics — thin wrapper over `quant.py` primitives.
 
-    if len(price_df) < 5:
+    price_df: Columns = tickers, index = datetime, values = prices.
+    weights: {ticker: portfolio weight}. Renormalised over available columns.
+    benchmark: optional benchmark **price** series (same frequency).
+    """
+    price_df = price_df.sort_index().ffill().dropna(how="all")
+    cols = [c for c in price_df.columns if c in weights]
+    if not cols or len(price_df) < 5:
+        return {}
+    price_df = price_df[cols]
+    returns = price_df.pct_change().dropna(how="all").fillna(0.0)
+
+    # renormalise weights over available columns
+    w = {c: float(weights[c]) for c in cols}
+    s = sum(w.values()) or 1.0
+    w = {c: v / s for c, v in w.items()}
+
+    port_ret = quant.portfolio_returns_from_weights(returns, w).dropna()
+    if len(port_ret) < 5:
         return {}
 
-    # 2. Compute returns
-    returns = price_df.pct_change().dropna()
-    w = np.array([weights[c] for c in returns.columns])
-    port_ret = returns.dot(w)
-
-    # 3. Geometric cumulative return
-    cum = (1 + port_ret).cumprod()
-    total_return = cum.iloc[-1] - 1
-    ann_return = (cum.iloc[-1]) ** (_TRADING_DAYS / len(cum)) - 1
-
-    # 4. Risk metrics
-    ann_vol = port_ret.std(ddof=1) * np.sqrt(_TRADING_DAYS)
-    rf_daily = rf_annual / _TRADING_DAYS
-    excess_ret = port_ret - rf_daily
-
-    # Sharpe
-    sharpe = (excess_ret.mean() / port_ret.std(ddof=1)) * np.sqrt(_TRADING_DAYS) if port_ret.std(ddof=1) > 0 else 0.0
-
-    # Sortino (downside deviation)
-    downside = port_ret[port_ret < 0]
-    downside_std = downside.std(ddof=1)
-    sortino = (excess_ret.mean() / downside_std) * np.sqrt(_TRADING_DAYS) if downside_std and downside_std > 0 else 0.0
-
-    # Max Drawdown
-    rolling_max = cum.cummax()
-    drawdown = cum / rolling_max - 1
-    max_dd = drawdown.min()
-
-    # Calmar ratio
-    calmar = ann_return / abs(max_dd) if max_dd < 0 else 0.0
-
-    # 5. Benchmark-relative metrics
-    beta = alpha = None
-    if benchmark is not None:
-        bench = benchmark.sort_index().ffill().pct_change().dropna()
-        aligned = pd.concat([port_ret, bench], axis=1).dropna()
-        aligned.columns = ["port", "bench"]
-
-        if len(aligned) >= 10:
-            cov = np.cov(aligned["port"], aligned["bench"], ddof=1)
-            var_b = cov[1, 1]
-            if var_b > 0:
-                beta = cov[0, 1] / var_b
-                # Jensen's alpha (annualised)
-                bench_ann = (1 + aligned["bench"]).prod() ** (_TRADING_DAYS / len(aligned)) - 1
-                alpha = ann_return - (rf_annual + beta * (bench_ann - rf_annual))
-
-    return {
-        "total_return_pct": total_return * 100,
-        "annual_return_pct": ann_return * 100,
-        "annual_vol_pct": ann_vol * 100,
-        "sharpe": sharpe,
-        "sortino": sortino,
-        "max_drawdown_pct": max_dd * 100,
-        "calmar": calmar,
-        "beta": beta,
-        "alpha": alpha * 100 if alpha is not None else None,
+    out = {
         "observations": len(port_ret),
+        "total_return_pct": quant.total_return(port_ret) * 100,
+        "annual_return_pct": quant.annualised_return(port_ret) * 100,
+        "annual_vol_pct": quant.annualised_volatility(port_ret) * 100,
+        "sharpe": quant.sharpe_ratio(port_ret, rf=rf_annual),
+        "sortino": quant.sortino_ratio(port_ret, mar=rf_annual),
+        "calmar": quant.calmar_ratio(port_ret),
+        "omega": quant.omega_ratio(port_ret, mar=rf_annual),
+        "ulcer_index": quant.ulcer_index(port_ret),
+        "skew": quant.skewness(port_ret),
+        "excess_kurtosis": quant.excess_kurtosis(port_ret),
+        "var_95_hist_pct": quant.historical_var(port_ret, alpha=0.05) * 100,
+        "cvar_95_hist_pct": quant.historical_cvar(port_ret, alpha=0.05) * 100,
+        "var_95_cornish_fisher_pct": quant.cornish_fisher_var(port_ret, alpha=0.05) * 100,
     }
+
+    dd_info = quant.max_drawdown(port_ret)
+    out["max_drawdown_pct"] = dd_info["max_drawdown"] * 100
+    out["drawdown_duration_days"] = dd_info["duration_days"]
+    out["drawdown_recovery_days"] = dd_info["recovery_days"]
+
+    # Benchmark-relative
+    out["beta"] = None
+    out["alpha"] = None
+    out["r_squared"] = None
+    out["idio_vol_pct"] = None
+    out["tracking_error_pct"] = None
+    out["information_ratio"] = None
+    if benchmark is not None:
+        bench_ret = benchmark.sort_index().ffill().pct_change().dropna()
+        fit = quant.market_model(port_ret, bench_ret, rf=rf_annual)
+        if fit is not None:
+            out["beta"] = fit.beta
+            out["alpha"] = fit.alpha_ann * 100
+            out["r_squared"] = fit.r_squared
+            out["idio_vol_pct"] = fit.idio_vol_ann * 100
+        ir = quant.information_ratio(port_ret, bench_ret)
+        out["tracking_error_pct"] = ir["tracking_error"] * 100 if not np.isnan(ir["tracking_error"]) else None
+        out["information_ratio"] = ir["information_ratio"] if not np.isnan(ir["information_ratio"]) else None
+
+    return out
 
 
 # ===========================================================================
@@ -358,24 +351,47 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
         lines.append(
             f"- Sharpe: {port_metrics['sharpe']:.2f}  "
             f"|  Sortino: {port_metrics['sortino']:.2f}  "
-            f"|  Calmar: {port_metrics['calmar']:.2f}"
+            f"|  Calmar: {port_metrics['calmar']:.2f}  "
+            f"|  Omega: {port_metrics['omega']:.2f}"
+        )
+
+        dd_extra = ""
+        if port_metrics.get("drawdown_duration_days") is not None:
+            dd_extra = f" (dur {port_metrics['drawdown_duration_days']}d"
+            rec = port_metrics.get("drawdown_recovery_days")
+            dd_extra += f", rec {rec}d)" if rec is not None else ", not recovered)"
+        lines.append(
+            f"- Max DD: {port_metrics['max_drawdown_pct']:+.2f}%{dd_extra}  "
+            f"|  Ulcer: {port_metrics['ulcer_index']:.2f}  "
+            f"|  Skew: {port_metrics['skew']:+.2f}  ExKurt: {port_metrics['excess_kurtosis']:+.2f}"
         )
         lines.append(
-            f"- Max DD: {port_metrics['max_drawdown_pct']:+.2f}%  "
-            f"|  Beta (SPY): {beta_s}  "
-            f"|  Alpha (Ann): {alpha_s}"
+            f"- VaR 95% (hist/C-F): {port_metrics['var_95_hist_pct']:.2f}% / "
+            f"{port_metrics['var_95_cornish_fisher_pct']:.2f}% daily  |  "
+            f"CVaR 95%: {port_metrics['cvar_95_hist_pct']:.2f}%"
+        )
+
+        r2_s = f"{port_metrics['r_squared']:.2f}" if port_metrics.get("r_squared") is not None else "N/A"
+        idio_s = f"{port_metrics['idio_vol_pct']:.2f}%" if port_metrics.get("idio_vol_pct") is not None else "N/A"
+        te_s = f"{port_metrics['tracking_error_pct']:.2f}%" if port_metrics.get("tracking_error_pct") is not None else "N/A"
+        ir_s = f"{port_metrics['information_ratio']:.2f}" if port_metrics.get("information_ratio") is not None else "N/A"
+        lines.append(
+            f"- vs SPY — β: {beta_s}  |  α(ann): {alpha_s}  |  R²: {r2_s}  |  "
+            f"Idio vol: {idio_s}  |  TE: {te_s}  |  IR: {ir_s}"
         )
 
 
     # Concentration (weight-based, no external calls needed)
     wts_list = [weights_raw.get(h["raw"], 0) / total_portfolio_val for h in holding_rows]
-    hhi = sum(w ** 2 for w in wts_list)
+    hhi_val = sum(w ** 2 for w in wts_list)
+    eff_n = (1 / hhi_val) if hhi_val > 0 else float("nan")
     top5_w = sum(sorted(wts_list, reverse=True)[:5]) * 100
-    conc_label = "concentrated" if hhi > 0.15 else "moderate" if hhi > 0.08 else "diversified"
+    top1_w = max(wts_list) * 100 if wts_list else 0
     lines.append("")
-    lines.append(f"**Concentration:** {len(holding_rows)} positions  |  Top-5: {top5_w:.1f}%  |  HHI: {hhi:.4f} ({conc_label})")
-    if top5_w > 70:
-        lines.append(f"⚠️  Top-5 weight {top5_w:.0f}% — consider diversifying")
+    lines.append(
+        f"**Concentration:** {len(holding_rows)} positions  |  "
+        f"Top-1: {top1_w:.1f}%  |  Top-5: {top5_w:.1f}%  |  HHI: {hhi_val:.4f}  |  Effective N: {eff_n:.1f}"
+    )
 
     # Data footer
     lines.append("")

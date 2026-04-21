@@ -1,16 +1,28 @@
-"""Portfolio risk, stress testing, position sizing, and allocation analysis."""
+"""Portfolio risk, stress testing, position sizing, and allocation.
+
+Data-only: returns numbers, not opinions.
+All statistics computed via `quant.py` primitives.
+"""
 import asyncio
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from scipy.stats import norm
 
 import app
-from helpers import strip_t212_ticker, fmt_float, position_value
+import quant
+from helpers import strip_t212_ticker, position_value
 
 mcp = app.mcp
+
+
+def _risk_free_annual(default: float = 0.045) -> float:
+    """10Y Treasury yield (^TNX) expressed as annual decimal. Falls back to default."""
+    try:
+        val = yf.Ticker("^TNX").fast_info.last_price
+        return float(val) / 100 if val is not None else default
+    except Exception:
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -18,10 +30,17 @@ mcp = app.mcp
 # ---------------------------------------------------------------------------
 
 async def _get_portfolio_risk() -> str:
-    """Run a comprehensive risk analysis on your portfolio: annualised return & volatility,
-    Sharpe ratio, Sortino ratio, Value at Risk, max drawdown, beta to SPY, and a correlation matrix.
-    Uses 1 year of daily price data."""
+    """Portfolio risk table — per-holding and portfolio-level stats over a 1-year lookback.
 
+    Reports (data only):
+      - Annualised return (CAGR), annualised vol, Sharpe, Sortino, Calmar
+      - Max drawdown + duration/recovery, Ulcer Index
+      - VaR/CVaR (historical, Cornish-Fisher), skew, excess kurtosis
+      - Market-model β, α, R² vs SPY, idiosyncratic vol
+      - Tracking error / information ratio vs SPY
+      - Correlation matrix
+      - Component / marginal contribution to portfolio risk
+    """
     try:
         positions = await app.t212.get_portfolio()
     except Exception as e:
@@ -30,104 +49,137 @@ async def _get_portfolio_risk() -> str:
     if not positions:
         return "No open positions to analyse."
 
-    tickers = list(dict.fromkeys(strip_t212_ticker(p["ticker"]) for p in positions))  # unique, ordered
+    tickers = list(dict.fromkeys(strip_t212_ticker(p["ticker"]) for p in positions))
 
     from helpers import fetch_historic_prices
-    
     try:
         closes = await fetch_historic_prices(tickers + ["SPY"], period="1y", interval="1d")
     except Exception as e:
         return f"Error fetching price history: {e}"
 
     if closes.empty:
-        return "No price data returned. Check that ticker symbols are valid."
-        
-    # Identify and drop columns (tickers) that failed entirely
+        return "No price data returned."
+
     closes = closes.dropna(axis=1, how="all")
-    missing_tickers = set(tickers + ["SPY"]) - set(closes.columns)
-    
-    if closes.empty:
-        return "Insufficient price data after filtering."
+    returns = closes.pct_change().iloc[1:].replace([np.inf, -np.inf], np.nan)
 
-    returns = closes.pct_change().iloc[1:]  # only strip first-row NaN from pct_change
-    returns = returns.replace([np.inf, -np.inf], np.nan)  # guard against div-by-zero spikes
-    TRADING_DAYS = 252
+    rf = _risk_free_annual()
 
-    try:
-        _rf = yf.Ticker("^TNX").fast_info
-        RISK_FREE = float(_rf.last_price) / 100
-    except Exception:
-        RISK_FREE = 0.045
-
-    lines = ["**Portfolio Risk Analytics — 1-Year Lookback**\n"]
-
-    # Filter to tickers that actually have data (>= 30 days)
     available = [t for t in tickers if t in returns.columns and returns[t].dropna().shape[0] >= 30]
     missing = [t for t in tickers if t not in available]
+
+    lines = [
+        f"**Portfolio Risk Analytics — 1Y daily, rf={rf*100:.2f}% (^TNX)**\n",
+    ]
     if missing:
-        lines.append(f"⚠️ Insufficient data for: {', '.join(missing)}")
-        lines.append(f"   (Identify if this ticker requires a different regional suffix or substitute the US ADR equivalent using the `find_instrument` tool or web search.)\n")
+        lines.append(f"Insufficient data (<30 bars): {', '.join(missing)}\n")
 
     if not available:
         return "No tickers had sufficient price history (need 30+ trading days)."
 
-    lines.append(f"{'Ticker':<10} {'Ann.Ret%':>10} {'Ann.Vol%':>10} {'Sharpe':>8} {'MaxDD%':>8} {'Beta':>7}")
-    lines.append("-" * 58)
+    spy_ret = returns["SPY"] if "SPY" in returns.columns else pd.Series(dtype=float)
 
-    spy_ret = returns.get("SPY")
-    spy_clean = spy_ret.dropna() if spy_ret is not None else pd.Series(dtype=float)
+    # Per-holding table
+    lines.append(
+        f"{'Ticker':<10} {'CAGR%':>8} {'Vol%':>7} {'Shrp':>6} {'Sort':>6} "
+        f"{'MaxDD%':>8} {'Beta':>6} {'R²':>6} {'Alpha%':>8} {'Skew':>6} {'ExKurt':>7}"
+    )
+    lines.append("-" * 90)
 
     for t in available:
         r = returns[t].dropna()
-        if r.empty:
-            continue
-        ann_ret = float(r.mean()) * TRADING_DAYS * 100
-        ann_vol = float(r.std()) * np.sqrt(TRADING_DAYS) * 100
-        sharpe = (ann_ret / 100 - RISK_FREE) / (ann_vol / 100) if ann_vol > 0 else 0
-        cum = (1 + r).cumprod()
-        max_dd = float(((cum / cum.cummax()) - 1).min()) * 100
+        cagr = quant.annualised_return(r) * 100
+        vol = quant.annualised_volatility(r) * 100
+        sh = quant.sharpe_ratio(r, rf=rf)
+        so = quant.sortino_ratio(r, mar=rf)
+        dd = quant.max_drawdown(r)["max_drawdown"] * 100
+        skew = quant.skewness(r)
+        exkurt = quant.excess_kurtosis(r)
 
-        beta = 0.0
-        if len(spy_clean) > 0:
-            # Align on overlapping dates
-            aligned = pd.concat([returns[t], spy_ret], axis=1, keys=[t, "SPY"]).dropna()
-            if len(aligned) >= 30:
-                cov = np.cov(aligned[t].values, aligned["SPY"].values)
-                beta = cov[0][1] / cov[1][1] if cov[1][1] != 0 else 0.0
+        fit = quant.market_model(r, spy_ret, rf=rf) if not spy_ret.empty else None
+        beta = fit.beta if fit else float("nan")
+        r2 = fit.r_squared if fit else float("nan")
+        alpha = fit.alpha_ann * 100 if fit else float("nan")
 
-        lines.append(f"{t:<10} {ann_ret:>+10.2f} {ann_vol:>10.2f} {sharpe:>8.2f} {max_dd:>+8.2f} {beta:>7.2f}")
+        def _f(v, d=2):
+            return f"{v:>.{d}f}" if v is not None and not (isinstance(v, float) and np.isnan(v)) else "N/A"
 
+        lines.append(
+            f"{t:<10} {_f(cagr,2):>8} {_f(vol,2):>7} {_f(sh,2):>6} {_f(so,2):>6} "
+            f"{_f(dd,2):>8} {_f(beta,2):>6} {_f(r2,2):>6} {_f(alpha,2):>8} {_f(skew,2):>6} {_f(exkurt,2):>7}"
+        )
+
+    # Portfolio-level
     weights_raw = {strip_t212_ticker(p["ticker"]): position_value(p) for p in positions}
     total_val = sum(weights_raw.values()) or 1
-    weights = {k: v / total_val for k, v in weights_raw.items()}
+    weights = {k: v / total_val for k, v in weights_raw.items() if k in available}
+    w_sum = sum(weights.values()) or 1
+    weights = {k: v / w_sum for k, v in weights.items()}
 
-    if available:
-        port_ret = sum(returns[t] * weights.get(t, 0) for t in available).dropna()
-        if len(port_ret) > 5:
-            ann_ret = float(port_ret.mean()) * TRADING_DAYS * 100
-            ann_vol = float(port_ret.std()) * np.sqrt(TRADING_DAYS) * 100
-            sharpe = (ann_ret / 100 - RISK_FREE) / (ann_vol / 100) if ann_vol > 0 else 0
-            neg = port_ret[port_ret < 0]
-            downside = float(neg.std()) * np.sqrt(TRADING_DAYS) if len(neg) > 1 else 0
-            sortino = (ann_ret / 100 - RISK_FREE) / downside if downside > 0 else 0
-            cum = (1 + port_ret).cumprod()
-            max_dd = float(((cum / cum.cummax()) - 1).min()) * 100
-            var95 = float(port_ret.quantile(0.05)) * 100
-            tail = port_ret[port_ret <= port_ret.quantile(0.05)]
-            cvar95 = float(tail.mean()) * 100 if len(tail) > 0 else var95
+    port_ret = quant.portfolio_returns_from_weights(returns[available], weights).dropna()
+    if len(port_ret) > 5:
+        cagr = quant.annualised_return(port_ret) * 100
+        vol = quant.annualised_volatility(port_ret) * 100
+        sh = quant.sharpe_ratio(port_ret, rf=rf)
+        so = quant.sortino_ratio(port_ret, mar=rf)
+        calmar = quant.calmar_ratio(port_ret)
+        omega = quant.omega_ratio(port_ret, mar=rf)
+        dd_info = quant.max_drawdown(port_ret)
+        dd_pct = dd_info["max_drawdown"] * 100
+        ulcer = quant.ulcer_index(port_ret)
+        pain = quant.pain_index(port_ret)
 
-            lines.append("-" * 58)
-            lines.append(f"\n**Portfolio Summary**")
-            lines.append(f"- Annualised return:   {ann_ret:+.2f}%")
-            lines.append(f"- Annualised vol:      {ann_vol:.2f}%")
-            lines.append(f"- Sharpe ratio:        {sharpe:.2f}")
-            lines.append(f"- Sortino ratio:       {sortino:.2f}")
-            lines.append(f"- Max drawdown:        {max_dd:.2f}%")
-            lines.append(f"- VaR (95%, daily):    {var95:.2f}%")
-            lines.append(f"- CVaR (95%, daily):   {cvar95:.2f}%")
-            lines.append(f"- Risk-free rate used: {RISK_FREE*100:.2f}% (10Y Treasury)")
+        var_h = quant.historical_var(port_ret, alpha=0.05) * 100
+        cvar_h = quant.historical_cvar(port_ret, alpha=0.05) * 100
+        var_cf = quant.cornish_fisher_var(port_ret, alpha=0.05) * 100
+        skew = quant.skewness(port_ret)
+        exkurt = quant.excess_kurtosis(port_ret)
 
-    if len(available) >= 2 and len(available) <= 10:
+        fit = quant.market_model(port_ret, spy_ret, rf=rf) if not spy_ret.empty else None
+        ir = quant.information_ratio(port_ret, spy_ret) if not spy_ret.empty else None
+
+        lines.append("-" * 90)
+        lines.append("\n**Portfolio Summary**")
+        lines.append(f"- CAGR:                 {cagr:+.2f}%")
+        lines.append(f"- Annualised vol:       {vol:.2f}%")
+        lines.append(f"- Sharpe:               {sh:.2f}")
+        lines.append(f"- Sortino (MAR=rf):     {so:.2f}")
+        lines.append(f"- Calmar:               {calmar:.2f}")
+        lines.append(f"- Omega (threshold=rf): {omega:.2f}")
+        lines.append(f"- Max drawdown:         {dd_pct:+.2f}%"
+                     + (f" (duration {dd_info['duration_days']}d, "
+                        f"{'recovered in ' + str(dd_info['recovery_days']) + 'd' if dd_info['recovery_days'] is not None else 'not recovered'})"
+                        if dd_info.get('duration_days') is not None else ""))
+        lines.append(f"- Ulcer Index:          {ulcer:.2f}")
+        lines.append(f"- Pain Index:           {pain:.2f}%")
+        lines.append(f"- Skew / Excess kurt:   {skew:+.2f} / {exkurt:+.2f}")
+        lines.append(f"- VaR 95% (hist):       {var_h:.2f}%  daily")
+        lines.append(f"- CVaR 95% (hist):      {cvar_h:.2f}%  daily")
+        lines.append(f"- VaR 95% (C-F):        {var_cf:.2f}%  daily  (skew/kurt adjusted)")
+        if fit:
+            lines.append(
+                f"- β / α / R² vs SPY:    {fit.beta:.2f} / {fit.alpha_ann*100:+.2f}% / {fit.r_squared:.2f}"
+            )
+            lines.append(f"- Idiosyncratic vol:    {fit.idio_vol_ann*100:.2f}%")
+        if ir:
+            lines.append(
+                f"- Tracking error / IR:  {ir['tracking_error']*100:.2f}% / {ir['information_ratio']:.2f}"
+            )
+
+        # Risk decomposition
+        decomp = quant.portfolio_risk_decomposition(returns[available], weights)
+        if not decomp.empty:
+            lines.append("\n**Risk Decomposition (annualised)**")
+            lines.append(f"{'Ticker':<10} {'Weight%':>8} {'MCTR%':>8} {'CCTR%':>8} {'%Risk':>7}")
+            lines.append("-" * 46)
+            for idx, row in decomp.iterrows():
+                lines.append(
+                    f"{idx:<10} {row['weight']*100:>7.1f}% "
+                    f"{row['marginal_risk']*100:>7.2f}% {row['component_risk_ann']*100:>7.2f}% "
+                    f"{row['pct_risk_contribution']*100:>6.1f}%"
+                )
+
+    if 2 <= len(available) <= 10:
         corr = returns[available].corr()
         lines.append(f"\n**Correlation Matrix**")
         header = f"{'':>8}" + "".join(f"{t[:6]:>8}" for t in available)
@@ -148,13 +200,18 @@ async def _get_portfolio_risk() -> str:
 
 @mcp.tool()
 async def calculate_position_size(
-    ticker: str, entry_price: float, stop_loss_price: float, risk_pct: float = 2.0,
+    ticker: str, entry_price: float, stop_loss_price: float,
+    risk_pct: float = 2.0, target_price: float | None = None,
+    win_probability: float | None = None,
 ) -> str:
-    """Calculate optimal position size based on risk management rules.
-    ticker: stock symbol, entry_price: planned entry, stop_loss_price: stop-loss level,
-    risk_pct: max portfolio risk per trade (default 2%).
-    Returns position size, shares, Kelly Criterion, and concentration impact."""
+    """Calculate position size from explicit risk-per-trade rules. Returns raw numbers only.
 
+    ticker: symbol (used only for label).
+    entry_price / stop_loss_price: trade levels.
+    risk_pct: percent of portfolio to risk on this trade (default 2%).
+    target_price: optional — if supplied with win_probability, Kelly fraction is computed.
+    win_probability: optional decimal in (0,1). MUST be user-supplied — no heuristic estimate.
+    """
     try:
         acct = await app.t212.get_account_summary()
     except Exception as e:
@@ -172,43 +229,43 @@ async def calculate_position_size(
     shares = int(max_risk / risk_per_share)
     pos_val = shares * entry_price
     pos_pct = (pos_val / total_value) * 100
-
-    def _info():
-        return yf.Ticker(ticker).info
-
-    kelly = win_prob = None
-    try:
-        info = await asyncio.to_thread(_info)
-        target = info.get("targetMeanPrice")
-        cur = info.get("currentPrice") or info.get("regularMarketPrice") or entry_price
-        if target and cur:
-            win_amount = abs(float(target) - entry_price)
-            rec = (info.get("recommendationKey") or "").lower()
-            win_prob = {"strong_buy": .65, "buy": .6, "hold": .5, "sell": .4, "strong_sell": .35}.get(rec, .5)
-            b = win_amount / risk_per_share if risk_per_share > 0 else 1
-            kelly = max(0, win_prob - ((1 - win_prob) / b)) if b > 0 else 0
-    except Exception:
-        pass
+    r_multiple = ((target_price - entry_price) / risk_per_share) if target_price else None
 
     ccy = acct.get("currency", "")
     lines = [
         f"**Position Size — {ticker.upper()}**\n",
-        f"- Entry: {ccy} {entry_price:,.2f}  |  Stop: {ccy} {stop_loss_price:,.2f}  |  Risk/share: {ccy} {risk_per_share:,.2f}",
+        f"- Entry: {ccy} {entry_price:,.4f}  Stop: {ccy} {stop_loss_price:,.4f}  Risk/share: {ccy} {risk_per_share:,.4f}",
         f"- Direction: {'LONG' if entry_price > stop_loss_price else 'SHORT'}",
         "",
-        f"**Risk Management**",
-        f"- Portfolio: {ccy} {total_value:,.2f}  |  Max risk ({risk_pct}%): {ccy} {max_risk:,.2f}",
-        f"- **Shares: {shares:,}**  |  Value: {ccy} {pos_val:,.2f}  |  Weight: {pos_pct:.1f}%",
+        f"**Fixed-fractional sizing**",
+        f"- Portfolio: {ccy} {total_value:,.2f}   Max risk @ {risk_pct}%: {ccy} {max_risk:,.2f}",
+        f"- Shares: {shares:,}   Position value: {ccy} {pos_val:,.2f}   Weight: {pos_pct:.2f}%",
     ]
 
-    if kelly is not None:
-        ks = int(kelly * total_value / entry_price)
-        lines += ["", f"**Kelly Criterion** — win prob {win_prob*100:.0f}%, fraction {kelly*100:.1f}%",
-                   f"- Full Kelly: {ks:,} shares  |  Half-Kelly (safer): {ks//2:,} shares"]
+    if target_price is not None and r_multiple is not None:
+        reward_per_share = abs(target_price - entry_price)
+        lines.append("")
+        lines.append(f"**Reward / risk**")
+        lines.append(f"- Target: {ccy} {target_price:,.4f}  Reward/share: {ccy} {reward_per_share:,.4f}")
+        lines.append(f"- R-multiple: {r_multiple:.2f}R")
 
-    if pos_pct > 20:
-        lines.append(f"\nPosition weight: {pos_pct:.1f}% of portfolio")
+    if win_probability is not None and target_price is not None:
+        p = max(0.0, min(1.0, float(win_probability)))
+        b = abs(target_price - entry_price) / risk_per_share
+        kelly = max(0.0, p - (1 - p) / b) if b > 0 else 0.0
+        k_shares = int(kelly * total_value / entry_price) if entry_price > 0 else 0
+        lines += [
+            "",
+            f"**Kelly (user-supplied p={p:.2f})**",
+            f"- Full Kelly fraction: {kelly*100:.2f}%  ({k_shares:,} shares)",
+            f"- Half Kelly:          {kelly*50:.2f}%  ({k_shares//2:,} shares)",
+        ]
+    elif target_price is None or win_probability is None:
+        lines.append("")
+        lines.append("_Kelly requires both `target_price` and `win_probability` — not auto-estimated._")
 
+    lines.append("")
+    lines.append(f"Position weight: {pos_pct:.2f}% of portfolio.")
     return "\n".join(lines)
 
 
@@ -216,11 +273,12 @@ async def calculate_position_size(
 # Portfolio Stress Test
 # ---------------------------------------------------------------------------
 
-async def _get_portfolio_stress_test(simulations: int = 1000) -> str:
-    """Run stress tests: historical crisis scenarios and Monte Carlo simulation.
-    simulations: number of Monte Carlo runs (default 1000).
-    Returns drawdowns under 2008 crisis, COVID crash, 2022 rate hikes, and probability distribution."""
+async def _get_portfolio_stress_test(simulations: int = 10_000) -> str:
+    """Stress test the portfolio against historical crisis windows and
+    run both parametric (normal) and bootstrap Monte Carlo for 1-year forward return.
 
+    Bootstrap resamples the empirical return distribution — no normality assumption.
+    """
     try:
         positions = await app.t212.get_portfolio()
     except Exception as e:
@@ -234,89 +292,108 @@ async def _get_portfolio_stress_test(simulations: int = 1000) -> str:
     total = sum(weights_raw.values()) or 1
     weights = {k: v / total for k, v in weights_raw.items()}
 
-    # Use max available history — try to go back as far as possible for scenarios
     from helpers import fetch_historic_prices
-    
-    
-    # Adaptive lookback: use longest period where at least 50% of the portfolio has sufficient data
     chosen_period = "max"
+    closes = pd.DataFrame()
     for p in ("max", "10y", "5y", "2y", "1y", "6mo"):
         closes = await fetch_historic_prices(tickers, period=p, interval="1d")
         if not closes.empty:
             avail = [t for t in tickers if t in closes.columns and closes[t].dropna().shape[0] >= 30]
-            if len(avail) >= max(1, len(tickers)//2):
+            if len(avail) >= max(1, len(tickers) // 2):
                 chosen_period = p
                 break
 
-
     if closes.empty:
-        return "No price data returned. Check that ticker symbols are valid."
-        
-    missing = set(tickers) - set(closes.columns)
-    
-    returns = closes.pct_change().iloc[1:]  # only strip first-row NaN; don't nuke rows with partial data
-    returns = returns.replace([np.inf, -np.inf], np.nan)
+        return "No price data returned."
 
+    returns = closes.pct_change().iloc[1:].replace([np.inf, -np.inf], np.nan)
     avail = [t for t in tickers if t in returns.columns and returns[t].dropna().shape[0] >= 30]
     missing = [t for t in tickers if t not in avail]
 
-    lines = ["**Portfolio Stress Test**\n"]
+    lines = [f"**Portfolio Stress Test — lookback {chosen_period}**\n"]
     if missing:
-        lines.append(f"⚠️ Insufficient data for: {', '.join(missing)}")
-        lines.append(f"   (Identify if this ticker requires a different regional suffix or substitute the US ADR equivalent using the `find_instrument` tool or web search.)\n")
+        lines.append(f"Insufficient data: {', '.join(missing)}\n")
 
     if not avail:
         return "No tickers had sufficient price history for stress testing."
 
-    # Determine earliest date available
     earliest = returns.index.min().strftime("%Y-%m-%d")
-    lines.append(f"_Data available from: {earliest}_\n")
+    lines.append(f"_Data from {earliest}_\n")
 
     scenarios = {
-        "2008 Financial Crisis": ("2008-09-01", "2009-03-09"),
-        "COVID Crash (2020)": ("2020-02-19", "2020-03-23"),
-        "2022 Rate Hike Selloff": ("2022-01-03", "2022-10-12"),
-        "2024 Aug VIX Spike": ("2024-07-16", "2024-08-05"),
+        "2008 GFC (Sep 08 – Mar 09)":  ("2008-09-01", "2009-03-09"),
+        "COVID crash (Feb – Mar 20)":  ("2020-02-19", "2020-03-23"),
+        "2022 rate-hike selloff":      ("2022-01-03", "2022-10-12"),
+        "2024 Aug VIX spike":          ("2024-07-16", "2024-08-05"),
     }
 
-    lines.append("**Historical Scenarios**")
-    lines.append(f"{'Scenario':<28} {'Impact':>12}")
-    lines.append("-" * 42)
+    lines.append("**Historical scenarios** (weights held fixed, returns compounded)")
+    lines.append(f"{'Scenario':<32} {'Impact':>10}")
+    lines.append("-" * 44)
     for name, (s, e) in scenarios.items():
         try:
             pr = returns.loc[s:e]
             if pr.empty or len(pr) < 2:
-                lines.append(f"{name:<28} {'no data':>12}")
+                lines.append(f"{name:<32} {'no data':>10}")
                 continue
-            port_ret = sum(
-                pr[t].sum() * weights.get(t, 0)
-                for t in avail if t in pr.columns
-            )
-            lines.append(f"{name:<28} {port_ret*100:>+10.1f}%")
+            # Proper compounding of weighted daily returns
+            w_ret = quant.portfolio_returns_from_weights(pr[[t for t in avail if t in pr.columns]],
+                                                         {t: weights.get(t, 0) for t in avail})
+            port_ret = float((1 + w_ret).prod() - 1)
+            lines.append(f"{name:<32} {port_ret*100:>+9.1f}%")
         except Exception:
-            lines.append(f"{name:<28} {'N/A':>12}")
+            lines.append(f"{name:<32} {'N/A':>10}")
 
-    if avail:
-        port_ret = sum(returns[t] * weights.get(t, 0) for t in avail).dropna()
-        if len(port_ret) >= 20:
-            mu = float(port_ret.mean())
-            sig = float(port_ret.std())
-            if sig > 0:  # guard against zero volatility
-                np.random.seed(42)
-                sims = sorted([float(np.cumprod(1 + np.random.normal(mu, sig, 252))[-1] - 1) for _ in range(simulations)])
-                p5, p25, p50, p75, p95 = [sims[int(p * simulations)] for p in [.05, .25, .5, .75, .95]]
+    port_ret = quant.portfolio_returns_from_weights(returns[avail],
+                                                    {t: weights.get(t, 0) for t in avail}).dropna()
 
-                lines += [
-                    f"\n**Monte Carlo ({simulations:,} runs, 1yr)**",
-                    f"- 5th pctile:  {p5*100:+.1f}%", f"- 25th:        {p25*100:+.1f}%",
-                    f"- **Median:    {p50*100:+.1f}%**", f"- 75th:        {p75*100:+.1f}%",
-                    f"- 95th pctile: {p95*100:+.1f}%", "",
-                    f"- P(loss): {sum(1 for r in sims if r < 0)/simulations*100:.1f}%",
-                    f"- P(>20% gain): {sum(1 for r in sims if r > .2)/simulations*100:.1f}%",
-                    f"- P(>20% loss): {sum(1 for r in sims if r < -.2)/simulations*100:.1f}%",
-                ]
-            else:
-                lines.append("\n⚠️ Portfolio volatility is zero — cannot run Monte Carlo.")
+    if len(port_ret) >= 20:
+        mu = float(port_ret.mean())
+        sig = float(port_ret.std(ddof=1))
+
+        # Parametric (normal) 1-year MC
+        lines.append(f"\n**Monte Carlo — parametric normal ({simulations:,} paths × 252d)**")
+        if sig > 0:
+            rng = np.random.default_rng(42)
+            sims = (1 + rng.normal(mu, sig, size=(simulations, 252))).prod(axis=1) - 1
+            qs = np.quantile(sims, [0.05, 0.25, 0.50, 0.75, 0.95])
+            lines += [
+                f"- 5th pctile:   {qs[0]*100:+.1f}%",
+                f"- 25th pctile:  {qs[1]*100:+.1f}%",
+                f"- Median:       {qs[2]*100:+.1f}%",
+                f"- 75th pctile:  {qs[3]*100:+.1f}%",
+                f"- 95th pctile:  {qs[4]*100:+.1f}%",
+                f"- P(loss):      {(sims < 0).mean()*100:.1f}%",
+                f"- P(>+20%):     {(sims > 0.20).mean()*100:.1f}%",
+                f"- P(<-20%):     {(sims < -0.20).mean()*100:.1f}%",
+            ]
+        else:
+            lines.append("zero volatility — skipped")
+
+        # Bootstrap (empirical) MC
+        lines.append(f"\n**Monte Carlo — bootstrap ({simulations:,} paths × 252d, empirical dist)**")
+        rng = np.random.default_rng(43)
+        samples = rng.choice(port_ret.values, size=(simulations, 252), replace=True)
+        b_sims = (1 + samples).prod(axis=1) - 1
+        bqs = np.quantile(b_sims, [0.05, 0.25, 0.50, 0.75, 0.95])
+        lines += [
+            f"- 5th pctile:   {bqs[0]*100:+.1f}%",
+            f"- 25th pctile:  {bqs[1]*100:+.1f}%",
+            f"- Median:       {bqs[2]*100:+.1f}%",
+            f"- 75th pctile:  {bqs[3]*100:+.1f}%",
+            f"- 95th pctile:  {bqs[4]*100:+.1f}%",
+            f"- P(loss):      {(b_sims < 0).mean()*100:.1f}%",
+            f"- P(>+20%):     {(b_sims > 0.20).mean()*100:.1f}%",
+            f"- P(<-20%):     {(b_sims < -0.20).mean()*100:.1f}%",
+        ]
+
+        # 1-day VaR at different alphas
+        lines.append("\n**1-day VaR / CVaR from empirical distribution**")
+        for a in (0.01, 0.05):
+            v_h = quant.historical_var(port_ret, alpha=a) * 100
+            cv_h = quant.historical_cvar(port_ret, alpha=a) * 100
+            v_cf = quant.cornish_fisher_var(port_ret, alpha=a) * 100
+            lines.append(f"- α={int(a*100)}%:  hist VaR {v_h:.2f}%   CVaR {cv_h:.2f}%   C-F VaR {v_cf:.2f}%")
 
     return "\n".join(lines)
 
@@ -326,9 +403,10 @@ async def _get_portfolio_stress_test(simulations: int = 1000) -> str:
 # ---------------------------------------------------------------------------
 
 async def _get_portfolio_allocation() -> str:
-    """Analyse portfolio allocation by sector, geography, and market cap.
-    Shows concentration metrics and diversification score."""
+    """Portfolio allocation by sector, geography, market cap, plus concentration metrics.
 
+    Data only — no diversification advice.
+    """
     try:
         positions = await app.t212.get_portfolio()
     except Exception as e:
@@ -349,8 +427,10 @@ async def _get_portfolio_allocation() -> str:
             return yf.Ticker(ticker).info
         try:
             info = await asyncio.to_thread(_f)
-            return {"sector": info.get("sector", "Unknown"), "country": info.get("country", "Unknown"),
-                    "marketCap": float(info.get("marketCap", 0) or 0), "name": info.get("shortName") or ticker}
+            return {"sector": info.get("sector", "Unknown"),
+                    "country": info.get("country", "Unknown"),
+                    "marketCap": float(info.get("marketCap", 0) or 0),
+                    "name": info.get("shortName") or ticker}
         except Exception:
             return {"sector": "Unknown", "country": "Unknown", "marketCap": 0, "name": ticker}
 
@@ -374,7 +454,7 @@ async def _get_portfolio_allocation() -> str:
         lines.append(f"\n**{label} Allocation**")
         for name, val in sorted(buckets.items(), key=lambda x: x[1], reverse=True):
             w = val / total_val * 100
-            lines.append(f"  {name:<22} {w:>5.1f}%  {'█' * int(w / 2)}")
+            lines.append(f"  {name:<22} {w:>5.1f}%")
 
     cap_buckets = {"Mega (>$200B)": 0, "Large ($10-200B)": 0, "Mid ($2-10B)": 0, "Small (<$2B)": 0}
     for h in holdings:
@@ -391,50 +471,45 @@ async def _get_portfolio_allocation() -> str:
             lines.append(f"  {b:<22} {w:>5.1f}%")
 
     wts = [h["value"] / total_val for h in holdings]
-    hhi = sum(w ** 2 for w in wts)
-    top5 = sum(w for w in sorted(wts, reverse=True)[:5]) * 100
+    sorted_w = sorted(wts, reverse=True)
+    top1 = sorted_w[0] * 100 if sorted_w else 0
+    top5 = sum(sorted_w[:5]) * 100
+    top10 = sum(sorted_w[:10]) * 100
+    hhi = quant.hhi(wts)
+    eff_n = quant.effective_n(wts)
+
     lines += [
         f"\n**Concentration**",
-        f"- Positions: {len(holdings)}  |  Top 5: {top5:.1f}%",
-        f"- HHI: {hhi:.4f}  |  Effective positions: {1/hhi:.1f}",
+        f"- Positions: {len(holdings)}",
+        f"- Top 1 / 5 / 10: {top1:.1f}% / {top5:.1f}% / {top10:.1f}%",
+        f"- HHI: {hhi:.4f}",
+        f"- Effective N (1/HHI): {eff_n:.1f}",
     ]
-    if top5 > 70:
-        lines.append(f"\nTop 5 = {top5:.0f}%")
 
     return "\n".join(lines)
 
 
 # ===========================================================================
-# NEW CONSOLIDATED ANALYZE PORTFOLIO ENDPOINT
+# Consolidated analyze_portfolio endpoint
 # ===========================================================================
 
 @mcp.tool()
-async def analyze_portfolio(metrics: str = "risk,stress,allocation", simulations: int = 1000) -> str:
-    """Run full quantitative analysis on your actual portfolio.
-    metrics: comma-separated combination of 'risk' (vol, sharpe, beta), 'stress' (monte carlo), 'allocation' (weights)"""
-    
+async def analyze_portfolio(metrics: str = "risk,stress,allocation", simulations: int = 10_000) -> str:
+    """Full quantitative analysis of your actual portfolio.
+    metrics: 'risk' (vol, Sharpe/Sortino/Calmar/Omega, drawdowns, VaR/CVaR/C-F, β/α/R², risk decomp) |
+             'stress' (historical scenarios + parametric + bootstrap MC) |
+             'allocation' (sector/geo/cap, HHI, effective N)
+    """
     m_list = [m.strip().lower() for m in metrics.split(",")]
     lines = []
-    
+
     if "risk" in m_list:
-        res = await _get_portfolio_risk()
-        if "_[DEPRECATED" in res:
-            res = res.split("]_", 1)[-1].strip()
-        lines.append(res)
-        
+        lines.append(await _get_portfolio_risk())
     if "allocation" in m_list:
         if lines: lines.append("\n")
-        res = await _get_portfolio_allocation()
-        if "_[DEPRECATED" in res:
-            res = res.split("]_", 1)[-1].strip()
-        lines.append(res)
-        
+        lines.append(await _get_portfolio_allocation())
     if "stress" in m_list:
         if lines: lines.append("\n")
-        res = await _get_portfolio_stress_test(simulations=simulations)
-        if "_[DEPRECATED" in res:
-            res = res.split("]_", 1)[-1].strip()
-        lines.append(res)
-        
-    return "\n".join(lines)
+        lines.append(await _get_portfolio_stress_test(simulations=simulations))
 
+    return "\n".join(lines)
