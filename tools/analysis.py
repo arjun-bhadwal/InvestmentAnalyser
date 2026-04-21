@@ -1,4 +1,8 @@
-"""Technical analysis, stock screener, sector rotation, and earnings calendar."""
+"""Technical indicators, stock screener, sector rotation (RRG), earnings calendar.
+
+Data-only outputs. Indicator labels are factual (values + thresholds crossed);
+no buy/sell or bullish/bearish language.
+"""
 import asyncio
 from datetime import datetime
 
@@ -8,6 +12,7 @@ import ta as ta_lib
 import yfinance as yf
 
 import app
+import quant
 from helpers import cached, cache_prices, cache_fundamentals, strip_t212_ticker, fmt_float, safe_float
 
 mcp = app.mcp
@@ -84,40 +89,32 @@ async def _get_technical_indicators_core(ticker: str) -> str:
     def _fmt(v, d=2):
         return f"{v:,.{d}f}" if v is not None else "N/A"
 
+    # Compute historical percentile rank of current RSI over the 6-month window
+    rsi_hist = df["rsi"].dropna() if "rsi" in df.columns else pd.Series(dtype=float)
+    rsi_pct = quant.historical_percentile(rsi, rsi_hist) if rsi is not None else None
+
     signals = []
     if rsi is not None:
-        if rsi < 30:
-            signals.append(f"RSI: {rsi:.1f} (below 30 threshold)")
-        elif rsi > 70:
-            signals.append(f"RSI: {rsi:.1f} (above 70 threshold)")
-        else:
-            signals.append(f"RSI: {rsi:.1f}")
+        extra = f" (pctile {rsi_pct:.0f} over lookback)" if rsi_pct is not None else ""
+        signals.append(f"RSI: {rsi:.1f}{extra}")
 
     if ma20 and ma50:
-        signals.append("MA20 > MA50" if ma20 > ma50 else "MA20 < MA50")
-
+        signals.append(f"MA20 {'>' if ma20 > ma50 else '<'} MA50")
     if ma50 and ma200:
-        signals.append("Golden Cross (MA50 > MA200)" if ma50 > ma200 else "Death Cross (MA50 < MA200)")
+        signals.append(f"MA50 {'>' if ma50 > ma200 else '<'} MA200")
 
     if macd_val is not None and macd_sig is not None and macd_hist is not None:
         prev_hist = float(prev.get("macd_hist") or 0)
         if macd_hist > 0 and prev_hist <= 0:
-            signals.append("MACD histogram crossed positive")
+            signals.append("MACD histogram crossed above zero")
         elif macd_hist < 0 and prev_hist >= 0:
-            signals.append("MACD histogram crossed negative")
-        elif macd_hist > 0:
-            signals.append("MACD histogram positive")
+            signals.append("MACD histogram crossed below zero")
         else:
-            signals.append("MACD histogram negative")
+            signals.append(f"MACD histogram sign: {'+' if macd_hist > 0 else '-'}")
 
     if bb_upper and bb_lower and bb_mid:
         bb_pct = (price - bb_lower) / (bb_upper - bb_lower) * 100 if (bb_upper - bb_lower) > 0 else 50
-        if bb_pct > 90:
-            signals.append(f"Price at upper BB ({bb_pct:.0f}% of range)")
-        elif bb_pct < 10:
-            signals.append(f"Price at lower BB ({bb_pct:.0f}% of range)")
-        else:
-            signals.append(f"Price within BB ({bb_pct:.0f}% of range)")
+        signals.append(f"%B (position in BB range): {bb_pct:.0f}%")
 
     lines = [
         f"**{rt.yf_symbol} — Technical Indicators** ({rt.currency})\n",
@@ -167,10 +164,19 @@ SECTOR_ETFS = {
 
 @cached(cache_prices)
 async def _get_sector_rotation() -> str:
-    """Return performance and momentum for all 11 S&P 500 sectors (SPDR ETFs) vs the S&P 500.
-    Shows 1-day, 1-week, 1-month, 3-month, and 1-year returns plus relative strength vs SPY.
-    Use this to identify where institutional money is flowing."""
+    """Sector rotation — period returns and RRG (Relative Rotation Graph) reading
+    for each SPDR sector ETF vs SPY.
 
+    Methodology (Julius de Kempenaer):
+      JdK RS-Ratio_t  = 100 + z-score of (sector/benchmark) over 63-day window
+      JdK RS-Momentum = 100 + (RS-Ratio - SMA(RS-Ratio, 21))
+    Quadrants (factual, no editorial spin):
+      Leading    (RS≥100, Mom≥100)
+      Weakening  (RS≥100, Mom<100)
+      Lagging    (RS<100, Mom<100)
+      Improving  (RS<100, Mom≥100)
+    Also reports market breadth: % of sectors above their 50/200-day SMA.
+    """
     symbols = list(SECTOR_ETFS.values()) + ["SPY"]
 
     def _fetch():
@@ -182,57 +188,86 @@ async def _get_sector_rotation() -> str:
         return f"Error fetching sector data: {e}"
 
     closes = data["Close"].dropna(how="all")
-    if closes.empty:
+    if closes.empty or "SPY" not in closes.columns:
         return "Could not retrieve sector data."
 
-    def _ret(sym, days):
-        col = closes[sym].dropna()
-        if len(col) < days + 1:
+    def _ret(col, days):
+        c = col.dropna()
+        if len(c) < days + 1:
             return None
-        return (float(col.iloc[-1]) - float(col.iloc[-(days + 1)])) / float(col.iloc[-(days + 1)]) * 100
+        return (float(c.iloc[-1]) / float(c.iloc[-(days + 1)]) - 1) * 100
 
     periods = {"1D": 1, "1W": 5, "1M": 21, "3M": 63, "1Y": 252}
-    spy_rets = {label: _ret("SPY", days) for label, days in periods.items()}
+    spy_rets = {lbl: _ret(closes["SPY"], d) for lbl, d in periods.items()}
 
     rows = []
     for name, sym in SECTOR_ETFS.items():
-        rets = {label: _ret(sym, days) for label, days in periods.items()}
-        rs_1m = (rets["1M"] - spy_rets["1M"]) if rets["1M"] is not None and spy_rets["1M"] is not None else None
-        rows.append((name, sym, rets, rs_1m))
+        if sym not in closes.columns:
+            continue
+        s = closes[sym]
+        rets = {lbl: _ret(s, d) for lbl, d in periods.items()}
+        rrg = quant.relative_strength_snapshot(s, closes["SPY"], rs_window=63, mom_window=21)
+        rows.append((name, sym, rets, rrg))
 
-    rows.sort(key=lambda x: x[2]["1M"] if x[2]["1M"] is not None else -999, reverse=True)
+    # Sort by quadrant then RS-Ratio descending
+    quadrant_order = {"leading": 0, "weakening": 1, "improving": 2, "lagging": 3, "n/a": 4}
+    rows.sort(key=lambda x: (quadrant_order.get(x[3]["quadrant"], 9),
+                             -(x[3]["rs_ratio"] if not np.isnan(x[3]["rs_ratio"]) else -1e9)))
 
     def _fs(v):
-        if v is None: return "  N/A "
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return "  N/A"
         return f"{'+' if v >= 0 else ''}{v:.1f}%"
 
+    def _fn(v, d=2):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return "N/A"
+        return f"{v:.{d}f}"
+
     lines = [
-        f"**Sector Rotation — {datetime.today().strftime('%d %b %Y')}**\n",
-        f"{'Sector':<22} {'ETF':<6} {'1D':>7} {'1W':>7} {'1M':>7} {'3M':>7} {'1Y':>7} {'vs SPY 1M':>10}",
-        "-" * 76,
+        f"**Sector Rotation — {datetime.today().strftime('%d %b %Y')}**",
+        f"_Returns (vs SPY) + JdK RS-Ratio (63d z-score) & RS-Momentum (21d). Parity = 100._\n",
+        f"{'Sector':<22} {'ETF':<6} {'1D':>7} {'1W':>7} {'1M':>7} {'3M':>7} {'1Y':>7} "
+        f"{'RS-Rat':>7} {'RS-Mom':>7} {'Quadrant':<10}",
+        "-" * 98,
     ]
 
-    for name, sym, rets, rs_1m in rows:
-        trend = "▲" if rs_1m and rs_1m > 0 else "▼" if rs_1m and rs_1m < 0 else " "
+    for name, sym, rets, rrg in rows:
         lines.append(
             f"{name:<22} {sym:<6} {_fs(rets['1D']):>7} {_fs(rets['1W']):>7} "
             f"{_fs(rets['1M']):>7} {_fs(rets['3M']):>7} {_fs(rets['1Y']):>7} "
-            f"{trend}{_fs(rs_1m):>9}"
+            f"{_fn(rrg['rs_ratio'],2):>7} {_fn(rrg['rs_momentum'],2):>7} {rrg['quadrant']:<10}"
         )
 
-    lines.append("-" * 76)
+    lines.append("-" * 98)
     lines.append(
         f"{'S&P 500 (SPY)':<22} {'SPY':<6} {_fs(spy_rets['1D']):>7} {_fs(spy_rets['1W']):>7} "
-        f"{_fs(spy_rets['1M']):>7} {_fs(spy_rets['3M']):>7} {_fs(spy_rets['1Y']):>7} {'benchmark':>10}"
+        f"{_fs(spy_rets['1M']):>7} {_fs(spy_rets['3M']):>7} {_fs(spy_rets['1Y']):>7} "
+        f"{'100.00':>7} {'100.00':>7} {'benchmark':<10}"
     )
 
-    leaders  = [r[0] for r in rows[:3] if r[3] and r[3] > 0]
-    laggards = [r[0] for r in rows[-3:] if r[3] and r[3] < 0]
+    # Market breadth on the 11-sector universe
+    sector_closes = closes[[s for s in SECTOR_ETFS.values() if s in closes.columns]]
+    above50 = quant.pct_above_ma(sector_closes, 50)
+    above200 = quant.pct_above_ma(sector_closes, 200)
+    nh = quant.new_highs_lows(sector_closes, window=252)
+
     lines.append("")
-    if leaders:
-        lines.append(f"**Inflow leaders (outperforming SPY):** {', '.join(leaders)}")
-    if laggards:
-        lines.append(f"**Outflow / underperforming:**           {', '.join(laggards)}")
+    lines.append("**Breadth (11 SPDR sectors)**")
+    if not np.isnan(above50):
+        lines.append(f"- % above 50-day SMA:  {above50*100:.0f}%")
+    if not np.isnan(above200):
+        lines.append(f"- % above 200-day SMA: {above200*100:.0f}%")
+    if nh["universe_size"] > 0:
+        lines.append(f"- 52w highs / lows:    {nh['new_highs']} / {nh['new_lows']} (of {nh['universe_size']})")
+
+    # Quadrant counts
+    from collections import Counter
+    counts = Counter(r[3]["quadrant"] for r in rows)
+    lines.append("")
+    lines.append("**RRG Quadrant distribution**")
+    for q in ("leading", "weakening", "lagging", "improving"):
+        lines.append(f"- {q.capitalize():<10} {counts.get(q, 0)}")
 
     return "\n".join(lines)
 

@@ -2,6 +2,8 @@
 import asyncio
 from datetime import datetime, timedelta
 
+import numpy as np
+import pandas as pd
 import yfinance as yf
 
 import app
@@ -59,11 +61,7 @@ async def _get_macro_dashboard() -> str:
 
         vix = market.get("VIX Fear Index (^VIX)", (None,))[0]
         if vix is not None:
-            if vix < 15: sig = f"VIX {vix:.1f} (below 15)"
-            elif vix < 20: sig = f"VIX {vix:.1f} (15–20)"
-            elif vix < 30: sig = f"VIX {vix:.1f} (20–30)"
-            else: sig = f"VIX {vix:.1f} (above 30)"
-            lines.append(f"\n**VIX:** {sig}")
+            lines.append(f"\n**VIX:** {vix:.2f}")
 
     if app.FRED_API_KEY:
         try:
@@ -116,85 +114,128 @@ async def _get_macro_dashboard() -> str:
 
 @cached(cache_macro)
 async def _get_fear_greed_index() -> str:
-    """Return a composite Fear & Greed score (0-100) based on VIX, momentum,
-    market breadth, and safe haven demand. 0=Extreme Fear, 100=Extreme Greed."""
+    """Market sentiment components expressed as **historical percentiles over
+    a 5-year rolling window**. No magic coefficients. Reports raw values + rank.
+
+    Components (each independently rank-transformed, 0 = extreme fear, 100 = extreme greed):
+      1. VIX level (inverted — high VIX → low percentile)
+      2. SPY price distance from its 125-day SMA (%)
+      3. Breadth: % of 11 SPDR sector ETFs above their 50-day SMA (snapshot)
+      4. 20-day realised SPY vol (inverted — high vol → low percentile)
+      5. Safe-haven demand: 1-month GLD return − 1-month SPY return (inverted)
+      6. Put/call proxy: 10-day return of TLT vs SPY (inverted — bonds outperform = fear)
+
+    The composite is a simple unweighted average of available component percentiles.
+    """
+    import quant
+
+    def _fetch_hist(sym, period="5y"):
+        try:
+            return yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=True)["Close"]
+        except Exception:
+            return pd.Series(dtype=float)
 
     def _fetch():
-        d = {}
-        try: d["vix"] = safe_float(yf.Ticker("^VIX").fast_info.last_price, fallback=None)
-        except Exception: d["vix"] = None
-
-        try:
-            spy = yf.Ticker("SPY").history(period="6mo", interval="1d", auto_adjust=True)["Close"]
-            d["spy_price"] = safe_float(spy.iloc[-1], fallback=None)
-            d["spy_ma125"] = safe_float(spy.rolling(125).mean().iloc[-1], fallback=None)
-        except Exception:
-            d["spy_price"] = d["spy_ma125"] = None
-
-        breadth_syms = ["XLK","XLF","XLV","XLE","XLI","XLB","XLRE","XLU","XLP","XLY","XLC"]
-        above, total = 0, 0
-        for sym in breadth_syms:
-            try:
-                h = yf.Ticker(sym).history(period="3mo", interval="1d", auto_adjust=True)["Close"]
-                if len(h) >= 50:
-                    total += 1
-                    if safe_float(h.iloc[-1]) > safe_float(h.rolling(50).mean().iloc[-1]):
-                        above += 1
-            except Exception: pass
-        d["breadth_pct"] = (above / total * 100) if total > 0 else None
-
-        try:
-            gold = yf.Ticker("GLD").history(period="1mo", interval="1d", auto_adjust=True)["Close"]
-            spy_h = yf.Ticker("SPY").history(period="1mo", interval="1d", auto_adjust=True)["Close"]
-            
-            g0, g1 = safe_float(gold.iloc[0]), safe_float(gold.iloc[-1])
-            s0, s1 = safe_float(spy_h.iloc[0]), safe_float(spy_h.iloc[-1])
-            
-            if g0 != 0 and s0 != 0:
-                d["safe_haven_diff"] = ((g1 - g0) / g0 * 100) - ((s1 - s0) / s0 * 100)
-            else:
-                d["safe_haven_diff"] = None
-        except Exception:
-            d["safe_haven_diff"] = None
-        return d
+        vix = _fetch_hist("^VIX", period="5y")
+        spy = _fetch_hist("SPY", period="5y")
+        gld = _fetch_hist("GLD", period="5y")
+        tlt = _fetch_hist("TLT", period="5y")
+        sector_closes = {}
+        for sym in ["XLK","XLF","XLV","XLE","XLI","XLB","XLRE","XLU","XLP","XLY","XLC"]:
+            s = _fetch_hist(sym, period="1y")
+            if not s.empty:
+                sector_closes[sym] = s
+        return vix, spy, gld, tlt, sector_closes
 
     try:
-        d = await asyncio.to_thread(_fetch)
+        vix, spy, gld, tlt, sector_closes = await asyncio.to_thread(_fetch)
     except Exception as e:
-        return f"Error computing Fear & Greed Index: {e}"
+        return f"Error computing Fear & Greed: {e}"
 
-    scores, components = [], []
+    components = []
+    percentiles = []
 
-    if d["vix"] is not None:
-        vix = d["vix"]
-        s = max(0, min(100, 100 - (vix - 12) * (100 / 28)))
-        scores.append(s)
-        components.append(f"- VIX ({vix:.1f}): score {s:.0f}")
+    # 1. VIX level — inverted (low VIX = greed)
+    if not vix.empty and len(vix) > 30:
+        last_vix = float(vix.iloc[-1])
+        raw_pct = quant.historical_percentile(last_vix, vix)
+        greed_pct = 100 - raw_pct
+        percentiles.append(greed_pct)
+        components.append(
+            f"- VIX:                {last_vix:>6.2f}   raw pctile {raw_pct:>5.1f}   greed score {greed_pct:>5.1f}"
+        )
 
-    if d["spy_price"] is not None and d["spy_ma125"] is not None:
-        pct = (d["spy_price"] / d["spy_ma125"] - 1) * 100
-        s = max(0, min(100, 50 + pct * 5))
-        scores.append(s)
-        components.append(f"- Momentum (SPY {pct:+.1f}% vs MA125): score {s:.0f}")
+    # 2. SPY distance from 125d SMA (%)
+    if not spy.empty and len(spy) > 150:
+        ma = spy.rolling(125).mean()
+        dist = (spy / ma - 1) * 100
+        last = float(dist.iloc[-1])
+        pct = quant.historical_percentile(last, dist.dropna())
+        percentiles.append(pct)
+        components.append(
+            f"- SPY vs 125d SMA:    {last:>+6.2f}%  pctile {pct:>5.1f}   greed score {pct:>5.1f}"
+        )
 
-    if d["breadth_pct"] is not None:
-        scores.append(d["breadth_pct"])
-        components.append(f"- Breadth ({d['breadth_pct']:.0f}% of tracked stocks above MA50): score {d['breadth_pct']:.0f}")
+    # 3. Breadth — % of sectors above MA50 (snapshot, not historical percentile)
+    if sector_closes:
+        df = pd.DataFrame(sector_closes)
+        above50 = quant.pct_above_ma(df, 50)
+        if not np.isnan(above50):
+            score = above50 * 100
+            percentiles.append(score)
+            components.append(
+                f"- Breadth (sec>MA50): {score:>6.1f}%  (greed score = breadth%)"
+            )
 
-    if d["safe_haven_diff"] is not None:
-        sh = d["safe_haven_diff"]
-        s = max(0, min(100, 50 - sh * 5))
-        scores.append(s)
-        components.append(f"- Safe Haven (Gold vs SPY 1M: {sh:+.1f}%): score {s:.0f}")
+    # 4. 20-day realised SPY vol — inverted
+    if not spy.empty and len(spy) > 100:
+        spy_ret = spy.pct_change()
+        rv = spy_ret.rolling(20).std(ddof=1) * np.sqrt(252) * 100
+        last_rv = float(rv.iloc[-1])
+        raw_pct = quant.historical_percentile(last_rv, rv.dropna())
+        greed_pct = 100 - raw_pct
+        percentiles.append(greed_pct)
+        components.append(
+            f"- 20d realised vol:   {last_rv:>6.2f}%  raw pctile {raw_pct:>5.1f}   greed score {greed_pct:>5.1f}"
+        )
 
-    if not scores:
-        return "Insufficient data."
+    # 5. Safe-haven demand — GLD 1M return minus SPY 1M return, inverted
+    if not gld.empty and not spy.empty and len(gld) > 250 and len(spy) > 250:
+        def _roll_1m(s):
+            return s.pct_change(21)
+        diff = (_roll_1m(gld) - _roll_1m(spy)).dropna() * 100
+        if len(diff) > 30:
+            last = float(diff.iloc[-1])
+            raw_pct = quant.historical_percentile(last, diff)
+            greed_pct = 100 - raw_pct
+            percentiles.append(greed_pct)
+            components.append(
+                f"- GLD-SPY 1M spread: {last:>+6.2f}%  raw pctile {raw_pct:>5.1f}   greed score {greed_pct:>5.1f}"
+            )
 
-    composite = sum(scores) / len(scores)
+    # 6. TLT vs SPY 10d return — bonds outperforming = risk-off
+    if not tlt.empty and not spy.empty and len(tlt) > 250 and len(spy) > 250:
+        diff10 = (tlt.pct_change(10) - spy.pct_change(10)).dropna() * 100
+        if len(diff10) > 30:
+            last = float(diff10.iloc[-1])
+            raw_pct = quant.historical_percentile(last, diff10)
+            greed_pct = 100 - raw_pct
+            percentiles.append(greed_pct)
+            components.append(
+                f"- TLT-SPY 10d spread:{last:>+6.2f}%  raw pctile {raw_pct:>5.1f}   greed score {greed_pct:>5.1f}"
+            )
+
+    if not percentiles:
+        return "Insufficient data for Fear & Greed components."
+
+    composite = sum(percentiles) / len(percentiles)
 
     return "\n".join([
-        f"**Fear & Greed Index — {datetime.today().strftime('%d %b %Y')}**\n",
-        f"## Composite Score: {composite:.0f}/100\n",
+        f"**Sentiment Components — {datetime.today().strftime('%d %b %Y')}**",
+        f"_All percentiles computed vs a rolling 5-year history per component._",
+        f"_Greed score = 0 (extreme fear) → 100 (extreme greed)._\n",
+        f"Composite (unweighted mean of components): {composite:.1f}/100",
+        "",
         "**Components:**",
     ] + components)
 

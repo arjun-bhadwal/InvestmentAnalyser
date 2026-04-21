@@ -12,8 +12,7 @@ mcp = app.mcp
 
 @cached(cache_fundamentals)
 async def _get_insider_trades_core(ticker: str) -> str:
-    """Return recent insider buy/sell activity for a stock via Finnhub.
-    Insider buying is one of the most reliable bullish signals."""
+    """Recent insider transactions for a stock via Finnhub — raw purchase/sale data."""
     from resolver import aresolve
 
     # Resolve ticker to get correct Finnhub format
@@ -59,7 +58,7 @@ async def _get_insider_trades_core(ticker: str) -> str:
         date_str = t.get("filingDate", "")[:10]
 
         if any(kw in tx_type.lower() for kw in ("purchase", "buy", "acquisition")):
-            side = "BUY ✅"
+            side = "BUY"
             total_buy += value
         elif any(kw in tx_type.lower() for kw in ("sale", "sell", "disposition")):
             side = "SELL"
