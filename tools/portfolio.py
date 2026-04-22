@@ -283,27 +283,32 @@ async def get_account_history(report_type: str = "all", limit: int = 20) -> str:
     """Return historical account activity.
     report_type: 'all' (default), 'trades' (orders), 'dividends', 'transactions' (cash)"""
     
-    lines = []
-    
+    tasks = []
     if report_type in ("all", "trades"):
-        res = await _get_trade_history(limit=limit)
-        if "_[DEPRECATED" in res:
-            res = res.split("]_", 1)[-1].strip()
-        lines.append(res)
-        
+        tasks.append(("trades", _get_trade_history(limit=limit)))
     if report_type in ("all", "dividends"):
-        if lines: lines.append("\n")
-        res = await _get_dividend_history(limit=limit)
-        if "_[DEPRECATED" in res:
-            res = res.split("]_", 1)[-1].strip()
-        lines.append(res)
-        
+        tasks.append(("dividends", _get_dividend_history(limit=limit)))
     if report_type in ("all", "transactions"):
-        if lines: lines.append("\n")
-        res = await _get_transaction_history(limit=limit)
-        if "_[DEPRECATED" in res:
-            res = res.split("]_", 1)[-1].strip()
-        lines.append(res)
+        tasks.append(("transactions", _get_transaction_history(limit=limit)))
+
+    if not tasks:
+        return f"Invalid report_type: {report_type}. Choose 'all', 'trades', 'dividends', or 'transactions'."
+
+    try:
+        keys, coros = zip(*tasks)
+        results = await asyncio.gather(*coros, return_exceptions=True)
         
-    return "\n".join(lines)
+        output_parts = []
+        for key, res in zip(keys, results):
+            if isinstance(res, Exception):
+                output_parts.append(f"Error fetching {key}: {res}")
+            else:
+                s_res = str(res)
+                if "_[DEPRECATED" in s_res:
+                    s_res = s_res.split("]_", 1)[-1].strip()
+                output_parts.append(s_res)
+        
+        return "\n\n---\n\n".join(output_parts)
+    except Exception as e:
+        return f"Account history error: {e}"
 
