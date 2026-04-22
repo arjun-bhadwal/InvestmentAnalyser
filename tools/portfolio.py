@@ -126,7 +126,7 @@ async def _get_dividend_history(limit: int = 20) -> str:
     """Return dividend payments received in your Trading 212 account.
     Use this to track income from dividend-paying stocks."""
     try:
-        dividends = await _t212()._get_dividend_history(limit=limit)
+        dividends = await _t212().get_dividend_history(limit=limit)
     except Exception as e:
         return f"Error fetching dividend history: {e}"
 
@@ -163,7 +163,7 @@ async def _get_dividend_history(limit: int = 20) -> str:
 async def _get_transaction_history(limit: int = 20) -> str:
     """Return cash transaction history: deposits and withdrawals on your Trading 212 account."""
     try:
-        transactions = await _t212()._get_transaction_history(limit=limit)
+        transactions = await _t212().get_transaction_history(limit=limit)
     except Exception as e:
         return f"Error fetching transaction history: {e}"
 
