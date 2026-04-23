@@ -686,7 +686,7 @@ async def get_opportunity_context(
         "momentum": dict(max_rsi=70, min_rsi=50, require_above_ma200=True, require_above_ma50=True, min_momentum_1m_pct=3),
         "deep_value": dict(max_rsi=30, min_rsi=0, require_above_ma200=False, min_analyst_upside_pct=20),
         "quality_growth": dict(max_rsi=65, min_rsi=0, require_above_ma200=True, max_pe=25, min_momentum_1m_pct=2),
-        "custom": dict(max_rsi=100, min_rsi=0, require_above_ma200=False),
+        "custom": dict(max_rsi=100, min_rsi=0, require_above_ma200=False, min_analyst_upside_pct=0),
     }
     knobs = style_map.get(style, style_map["value_dip"])
 
