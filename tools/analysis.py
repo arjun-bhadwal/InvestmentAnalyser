@@ -193,9 +193,10 @@ async def _get_sector_rotation() -> str:
 
     def _ret(col, days):
         c = col.dropna()
-        if len(c) < days + 1:
+        if len(c) < 2:
             return None
-        return (float(c.iloc[-1]) / float(c.iloc[-(days + 1)]) - 1) * 100
+        idx = min(days, len(c) - 1)
+        return (float(c.iloc[-1]) / float(c.iloc[-(idx + 1)]) - 1) * 100
 
     periods = {"1D": 1, "1W": 5, "1M": 21, "3M": 63, "1Y": 252}
     spy_rets = {lbl: _ret(closes["SPY"], d) for lbl, d in periods.items()}

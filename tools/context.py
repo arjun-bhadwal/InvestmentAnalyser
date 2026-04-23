@@ -484,9 +484,10 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
         col = df["Close"].dropna() if "Close" in df.columns else (
             df["close"].dropna() if "close" in df.columns else pd.Series(dtype=float)
         )
-        if len(col) < trading_days + 1:
+        if len(col) < 2:
             return None
-        start, end = float(col.iloc[-(trading_days + 1)]), float(col.iloc[-1])
+        idx = min(trading_days, len(col) - 1)
+        start, end = float(col.iloc[-(idx + 1)]), float(col.iloc[-1])
         return (end - start) / start * 100 if start != 0 else None
 
     def _fmt_ret(v: float | None) -> str:
@@ -686,7 +687,7 @@ async def get_opportunity_context(
         "momentum": dict(max_rsi=70, min_rsi=50, require_above_ma200=True, require_above_ma50=True, min_momentum_1m_pct=3),
         "deep_value": dict(max_rsi=30, min_rsi=0, require_above_ma200=False, min_analyst_upside_pct=20),
         "quality_growth": dict(max_rsi=65, min_rsi=0, require_above_ma200=True, max_pe=25, min_momentum_1m_pct=2),
-        "custom": dict(max_rsi=100, min_rsi=0, require_above_ma200=False),
+        "custom": dict(max_rsi=100, min_rsi=0, require_above_ma200=False, min_analyst_upside_pct=0),
     }
     knobs = style_map.get(style, style_map["value_dip"])
 

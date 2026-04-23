@@ -22,7 +22,6 @@ async def _get_macro_dashboard() -> str:
 
     market_syms = {
         "10Y Treasury (^TNX)": "^TNX",
-        "2Y Treasury (^IRX proxy)": "^TWO",
         "VIX Fear Index (^VIX)": "^VIX",
         "US Dollar Index (DX-Y.NYB)": "DX-Y.NYB",
         "Gold (GC=F)": "GC=F",

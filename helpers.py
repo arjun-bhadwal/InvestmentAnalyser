@@ -53,6 +53,14 @@ def cached(cache: TTLCache):
             if key in cache:
                 return cache[key]
             result = await fn(*args, **kwargs)
+            if isinstance(result, str) and ("Error" in result or "No data" in result or "Could not retrieve" in result):
+                return result
+            try:
+                import pandas as pd
+                if isinstance(result, pd.DataFrame) and result.empty:
+                    return result
+            except ImportError:
+                pass
             cache[key] = result
             return result
         return wrapper
