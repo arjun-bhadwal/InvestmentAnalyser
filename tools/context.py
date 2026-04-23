@@ -484,9 +484,10 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
         col = df["Close"].dropna() if "Close" in df.columns else (
             df["close"].dropna() if "close" in df.columns else pd.Series(dtype=float)
         )
-        if len(col) < trading_days + 1:
+        if len(col) < 2:
             return None
-        start, end = float(col.iloc[-(trading_days + 1)]), float(col.iloc[-1])
+        idx = min(trading_days, len(col) - 1)
+        start, end = float(col.iloc[-(idx + 1)]), float(col.iloc[-1])
         return (end - start) / start * 100 if start != 0 else None
 
     def _fmt_ret(v: float | None) -> str:
