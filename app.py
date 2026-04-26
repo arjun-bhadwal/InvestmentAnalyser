@@ -54,6 +54,12 @@ async def lifespan(server):
     print("="*50 + "\n", file=sys.stderr)
 
     t212 = T212Client(api_key=T212_API_KEY, api_secret=T212_API_SECRET, mode=T212_MODE)
+    
+    # Increase thread pool size for parallel yfinance fetches
+    import concurrent.futures
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=32))
+    
     yield
     await t212.aclose()
 
