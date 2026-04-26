@@ -180,7 +180,10 @@ async def _get_sector_rotation() -> str:
     symbols = list(SECTOR_ETFS.values()) + ["SPY"]
 
     def _fetch():
-        return yf.download(symbols, period="1y", interval="1d", auto_adjust=True, progress=False)
+        import sys
+        from contextlib import redirect_stdout
+        with redirect_stdout(sys.stderr):
+            return yf.download(symbols, period="1y", interval="1d", auto_adjust=True, progress=False)
 
     try:
         data = await asyncio.to_thread(_fetch)
@@ -294,9 +297,12 @@ async def get_earnings_calendar() -> str:
 
     async def _fetch_earnings(ticker):
         def _f():
+            import sys
+            from contextlib import redirect_stdout
             t = yf.Ticker(ticker)
-            cal = t.calendar
-            info = t.info
+            with redirect_stdout(sys.stderr):
+                cal = t.calendar
+                info = t.info
             return cal, info
         try:
             cal, info = await asyncio.wait_for(asyncio.to_thread(_f), timeout=8.0)
@@ -400,7 +406,13 @@ async def _screen_stocks_core(
         """Download in sub-batches if the main download yields nothing."""
         # Try full batch first
         try:
-            df = await asyncio.to_thread(yf.download, syms, period="1y", interval="1d", auto_adjust=True, progress=False)
+            def _dl():
+                import sys
+                from contextlib import redirect_stdout
+                with redirect_stdout(sys.stderr):
+                    return yf.download(syms, period="1y", interval="1d", auto_adjust=True, progress=False)
+
+            df = await asyncio.to_thread(_dl)
             if not df.empty:
                 if isinstance(df.columns, pd.MultiIndex):
                     return df["Close"]
@@ -414,7 +426,13 @@ async def _screen_stocks_core(
         
         async def _get_chunk(c):
             try:
-                d = await asyncio.to_thread(yf.download, c, period="1y", interval="1d", auto_adjust=True, progress=False)
+                def _dl():
+                    import sys
+                    from contextlib import redirect_stdout
+                    with redirect_stdout(sys.stderr):
+                        return yf.download(c, period="1y", interval="1d", auto_adjust=True, progress=False)
+
+                d = await asyncio.to_thread(_dl)
                 if d.empty: return pd.DataFrame()
                 if isinstance(d.columns, pd.MultiIndex):
                     return d["Close"]
@@ -477,7 +495,11 @@ async def _screen_stocks_core(
 
     async def _fund(sym):
         def _f():
-            info = yf.Ticker(sym).info
+            import sys
+            from contextlib import redirect_stdout
+            t = yf.Ticker(sym)
+            with redirect_stdout(sys.stderr):
+                info = t.info
             return {
                 "pe": info.get("trailingPE"), "target": info.get("targetMeanPrice"),
                 "cur_price": info.get("currentPrice") or info.get("regularMarketPrice"),

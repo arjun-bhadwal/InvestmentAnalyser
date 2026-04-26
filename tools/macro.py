@@ -29,15 +29,18 @@ async def _get_macro_dashboard() -> str:
     }
 
     def _fetch_market():
+        import sys
+        from contextlib import redirect_stdout
         results = {}
-        for label, sym in market_syms.items():
-            try:
-                fi = yf.Ticker(sym).fast_info
-                price, prev = fi.last_price, fi.previous_close
-                chg = ((price - prev) / prev * 100) if prev else 0
-                results[label] = (price, chg)
-            except Exception:
-                results[label] = (None, None)
+        with redirect_stdout(sys.stderr):
+            for label, sym in market_syms.items():
+                try:
+                    fi = yf.Ticker(sym).fast_info
+                    price, prev = fi.last_price, fi.previous_close
+                    chg = ((price - prev) / prev * 100) if prev else 0
+                    results[label] = (price, chg)
+                except Exception:
+                    results[label] = (None, None)
         return results
 
     try:
@@ -129,8 +132,11 @@ async def _get_fear_greed_index() -> str:
     import quant
 
     def _fetch_hist(sym, period="5y"):
+        import sys
+        from contextlib import redirect_stdout
         try:
-            return yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=True)["Close"]
+            with redirect_stdout(sys.stderr):
+                return yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=True)["Close"]
         except Exception:
             return pd.Series(dtype=float)
 
