@@ -2,6 +2,7 @@
 Shared application state: FastMCP instance, T212 client, environment config.
 All tool modules import from here — no circular imports.
 """
+import asyncio
 import os
 from contextlib import asynccontextmanager
 
