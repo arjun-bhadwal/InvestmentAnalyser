@@ -18,8 +18,11 @@ mcp = app.mcp
 
 def _risk_free_annual(default: float = 0.045) -> float:
     """10Y Treasury yield (^TNX) expressed as annual decimal. Falls back to default."""
+    import sys
+    from contextlib import redirect_stdout
     try:
-        val = yf.Ticker("^TNX").fast_info.last_price
+        with redirect_stdout(sys.stderr):
+            val = yf.Ticker("^TNX").fast_info.last_price
         return float(val) / 100 if val is not None else default
     except Exception:
         return default
@@ -424,7 +427,10 @@ async def _get_portfolio_allocation() -> str:
 
     async def _meta(ticker):
         def _f():
-            return yf.Ticker(ticker).info
+            import sys
+            from contextlib import redirect_stdout
+            with redirect_stdout(sys.stderr):
+                return yf.Ticker(ticker).info
         try:
             info = await asyncio.to_thread(_f)
             return {"sector": info.get("sector", "Unknown"),
