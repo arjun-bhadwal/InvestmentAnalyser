@@ -256,9 +256,12 @@ def _isin_to_tickers(isin: str) -> list[str]:
 # ---------------------------------------------------------------------------
 def _silent_history(symbol: str, period: str = "5d", interval: str = "1d") -> pd.DataFrame:
     import logging
+    import sys
+    from contextlib import redirect_stdout
     logging.getLogger('yfinance').setLevel(logging.CRITICAL)
     try:
-        return yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
+        with redirect_stdout(sys.stderr):
+            return yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
     except Exception:
         return pd.DataFrame()
 
@@ -405,11 +408,14 @@ async def fetch_fast_price(
     rt = await aresolve(raw)
 
     def _fetch():
+        import sys
+        from contextlib import redirect_stdout
         try:
-            fi = yf.Ticker(rt.yf_symbol).fast_info
-            last = float(fi.last_price) if fi.last_price is not None else None
-            prev = float(fi.previous_close) if fi.previous_close is not None else None
-            return last, prev
+            with redirect_stdout(sys.stderr):
+                fi = yf.Ticker(rt.yf_symbol).fast_info
+                last = float(fi.last_price) if fi.last_price is not None else None
+                prev = float(fi.previous_close) if fi.previous_close is not None else None
+                return last, prev
         except Exception:
             return None, None
 
@@ -426,27 +432,30 @@ async def fetch_fundamental_dict(raw: str) -> tuple[ResolvedTicker, dict]:
     rt = await aresolve(raw)
     
     def _fetch():
+        import sys
+        from contextlib import redirect_stdout
         t = yf.Ticker(rt.yf_symbol)
         info = {}
-        try:
-            info = t.info or {}
-        except Exception:
-            pass
-            
-        # Merge key metrics from fast_info if missing in info
-        try:
-            fi = t.fast_info
-            if not info.get("marketCap") and getattr(fi, "market_cap", None):
-                info["marketCap"] = fi.market_cap
-            if not info.get("currentPrice") and getattr(fi, "last_price", None):
-                info["currentPrice"] = fi.last_price
-            if not info.get("currency") and getattr(fi, "currency", None):
-                info["currency"] = fi.currency
-            if not info.get("sharesOutstanding") and getattr(fi, "shares", None):
-                info["sharesOutstanding"] = fi.shares
-        except Exception:
-            pass
-            
+        with redirect_stdout(sys.stderr):
+            try:
+                info = t.info or {}
+            except Exception:
+                pass
+                
+            # Merge key metrics from fast_info if missing in info
+            try:
+                fi = t.fast_info
+                if not info.get("marketCap") and getattr(fi, "market_cap", None):
+                    info["marketCap"] = fi.market_cap
+                if not info.get("currentPrice") and getattr(fi, "last_price", None):
+                    info["currentPrice"] = fi.last_price
+                if not info.get("currency") and getattr(fi, "currency", None):
+                    info["currency"] = fi.currency
+                if not info.get("sharesOutstanding") and getattr(fi, "shares", None):
+                    info["sharesOutstanding"] = fi.shares
+            except Exception:
+                pass
+                
         return info
 
     from helpers import YF_INFO_SEM
@@ -469,10 +478,13 @@ async def fetch_historic_prices_scaled(
 
     def _download(syms):
         import logging
+        import sys
+        from contextlib import redirect_stdout
         logging.getLogger('yfinance').setLevel(logging.CRITICAL)
         try:
-            return yf.download(syms, period=period, interval=interval,
-                               auto_adjust=True, progress=False)
+            with redirect_stdout(sys.stderr):
+                return yf.download(syms, period=period, interval=interval,
+                                   auto_adjust=True, progress=False)
         except Exception:
             return pd.DataFrame()
 

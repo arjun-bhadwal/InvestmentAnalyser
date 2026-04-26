@@ -421,16 +421,26 @@ async def get_ticker_context(tickers: str, depth: str = "standard") -> str:
     if not syms:
         return "Please provide at least one ticker."
     
-    # Cap batch size to avoid massive responses and timeouts
-    target_syms = syms[:5]
+    # Cap batch size to avoid massive responses and timeouts.
+    # Standard: max 5. Deep: max 3 (very expensive).
+    limit = 5 if depth == "standard" else 3
+    target_syms = syms[:limit]
     
-    results = await asyncio.gather(*[_get_single_ticker_context(s, depth) for s in target_syms])
+    # Use a semaphore to process only a few tickers at a time to avoid thread pool exhaustion
+    async def _throttled_get(s):
+        async with _YF_META_SEM:
+            try:
+                return await _get_single_ticker_context(s, depth)
+            except Exception as e:
+                return f"Error processing {s}: {e}"
+
+    results = await asyncio.gather(*[_throttled_get(s) for s in target_syms])
     
     combined = "\n\n" + "="*80 + "\n\n"
     combined = combined.join(results)
     
-    if len(syms) > 5:
-        combined += f"\n\n_Note: Batch capped at first 5 tickers. Omitted: {', '.join(syms[5:])}_"
+    if len(syms) > limit:
+        combined += f"\n\n_Note: Batch capped at first {limit} tickers for stability. Omitted: {', '.join(syms[limit:])}_"
         
     return combined
 

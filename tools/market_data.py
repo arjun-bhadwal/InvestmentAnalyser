@@ -150,15 +150,18 @@ async def _get_analyst_ratings(ticker: str) -> str:
     Use this to understand what professional analysts think."""
 
     def _fetch():
+        import sys
+        from contextlib import redirect_stdout
         t = yf.Ticker(ticker)
-        info = t.info
-        # yfinance ≥0.2.x: per-analyst history is in upgrades_downgrades
-        # .recommendations now returns aggregate period counts — not useful here
-        upgrades = None
-        try:
-            upgrades = t.upgrades_downgrades
-        except Exception:
-            pass
+        with redirect_stdout(sys.stderr):
+            info = t.info
+            # yfinance ≥0.2.x: per-analyst history is in upgrades_downgrades
+            # .recommendations now returns aggregate period counts — not useful here
+            upgrades = None
+            try:
+                upgrades = t.upgrades_downgrades
+            except Exception:
+                pass
         return info, upgrades
 
     try:
@@ -226,12 +229,15 @@ async def _get_market_snapshot() -> str:
     }
 
     def _fetch():
-        return yf.download(
-            list(indices.values()),
-            period="5d",
-            auto_adjust=True,
-            progress=False,
-        )
+        import sys
+        from contextlib import redirect_stdout
+        with redirect_stdout(sys.stderr):
+            return yf.download(
+                list(indices.values()),
+                period="5d",
+                auto_adjust=True,
+                progress=False,
+            )
 
     try:
         data = await asyncio.to_thread(_fetch)
@@ -276,8 +282,11 @@ async def _get_financial_statements(ticker: str) -> str:
     from helpers import fmt_billions
 
     def _fetch():
+        import sys
+        from contextlib import redirect_stdout
         t = yf.Ticker(ticker)
-        return {"info": t.info, "income": t.income_stmt, "balance": t.balance_sheet, "cashflow": t.cashflow}
+        with redirect_stdout(sys.stderr):
+            return {"info": t.info, "income": t.income_stmt, "balance": t.balance_sheet, "cashflow": t.cashflow}
 
     try:
         d = await asyncio.to_thread(_fetch)
@@ -368,8 +377,11 @@ async def _get_dcf_valuation(ticker: str, growth_rate_pct: float = 0.0, discount
     from helpers import fmt_billions as _b
 
     def _fetch():
+        import sys
+        from contextlib import redirect_stdout
         t = yf.Ticker(ticker)
-        return t.info, t.cashflow
+        with redirect_stdout(sys.stderr):
+            return t.info, t.cashflow
 
     try:
         info, cf = await asyncio.to_thread(_fetch)
@@ -475,7 +487,10 @@ async def _compare_peers(tickers: str) -> str:
             info, yf_sym = {}, sym
 
         def _hist():
-            return yf.Ticker(yf_sym).history(period="1y", interval="1d", auto_adjust=True)
+            import sys
+            from contextlib import redirect_stdout
+            with redirect_stdout(sys.stderr):
+                return yf.Ticker(yf_sym).history(period="1y", interval="1d", auto_adjust=True)
         try:
             hist = await asyncio.wait_for(asyncio.to_thread(_hist), timeout=10.0)
         except Exception:
@@ -712,7 +727,10 @@ async def get_price_history(tickers: str, period: str = "5y", interval: str = "1
         try:
             rt = await aresolve(raw)
             def _fetch(sym=rt.yf_symbol, p=period, iv=interval):
-                return yf.Ticker(sym).history(period=p, interval=iv, auto_adjust=True)
+                import sys
+                from contextlib import redirect_stdout
+                with redirect_stdout(sys.stderr):
+                    return yf.Ticker(sym).history(period=p, interval=iv, auto_adjust=True)
 
             df = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=15.0)
             if df.empty:
