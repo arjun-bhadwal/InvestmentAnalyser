@@ -43,7 +43,9 @@ async def _get_news_core(ticker: str, max_headlines: int = 5, company_name: str 
         return client.company_news(finnhub_sym, _from=str(week_ago), to=str(today))
 
     try:
-        articles = await asyncio.to_thread(_fetch)
+        articles = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=15.0)
+    except asyncio.TimeoutError:
+        articles = []
     except Exception as e:
         articles = []
 

@@ -240,7 +240,9 @@ async def _get_market_snapshot() -> str:
             )
 
     try:
-        data = await asyncio.to_thread(_fetch)
+        data = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=20.0)
+    except asyncio.TimeoutError:
+        return "Market snapshot timed out. Try again later."
     except Exception as e:
         return f"Error fetching market data: {e}"
 
@@ -289,7 +291,9 @@ async def _get_financial_statements(ticker: str) -> str:
             return {"info": t.info, "income": t.income_stmt, "balance": t.balance_sheet, "cashflow": t.cashflow}
 
     try:
-        d = await asyncio.to_thread(_fetch)
+        d = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=25.0)
+    except asyncio.TimeoutError:
+        return f"Financial statements request timed out for {ticker}."
     except Exception as e:
         return f"Error fetching financial statements for {ticker}: {e}"
 
@@ -384,7 +388,9 @@ async def _get_dcf_valuation(ticker: str, growth_rate_pct: float = 0.0, discount
             return t.info, t.cashflow
 
     try:
-        info, cf = await asyncio.to_thread(_fetch)
+        info, cf = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=20.0)
+    except asyncio.TimeoutError:
+        return f"DCF valuation data request timed out for {ticker}."
     except Exception as e:
         return f"Error fetching data for DCF: {e}"
 
