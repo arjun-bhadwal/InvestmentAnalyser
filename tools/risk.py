@@ -32,27 +32,11 @@ def _risk_free_annual(default: float = 0.045) -> float:
 # Portfolio Risk Analytics
 # ---------------------------------------------------------------------------
 
-async def _get_portfolio_risk() -> str:
-    """Portfolio risk table — per-holding and portfolio-level stats over a 1-year lookback.
-
-    Reports (data only):
-      - Annualised return (CAGR), annualised vol, Sharpe, Sortino, Calmar
-      - Max drawdown + duration/recovery, Ulcer Index
-      - VaR/CVaR (historical, Cornish-Fisher), skew, excess kurtosis
-      - Market-model β, α, R² vs SPY, idiosyncratic vol
-      - Tracking error / information ratio vs SPY
-      - Correlation matrix
-      - Component / marginal contribution to portfolio risk
-    """
-    try:
-        positions = await app.t212.get_portfolio()
-    except Exception as e:
-        return f"Error fetching portfolio: {e}"
-
-    if not positions:
-        return "No open positions to analyse."
-
-    tickers = list(dict.fromkeys(strip_t212_ticker(p["ticker"]) for p in positions))
+async def _compute_portfolio_risk(weights_raw: dict[str, float]) -> str:
+    """Core portfolio risk computation engine taking explicit weights."""
+    tickers = list(weights_raw.keys())
+    if not tickers:
+        return "No tickers to analyse."
 
     from helpers import fetch_historic_prices
     try:
@@ -113,7 +97,6 @@ async def _get_portfolio_risk() -> str:
         )
 
     # Portfolio-level
-    weights_raw = {strip_t212_ticker(p["ticker"]): position_value(p) for p in positions}
     total_val = sum(weights_raw.values()) or 1
     weights = {k: v / total_val for k, v in weights_raw.items() if k in available}
     w_sum = sum(weights.values()) or 1
@@ -276,22 +259,13 @@ async def calculate_position_size(
 # Portfolio Stress Test
 # ---------------------------------------------------------------------------
 
-async def _get_portfolio_stress_test(simulations: int = 10_000) -> str:
-    """Stress test the portfolio against historical crisis windows and
-    run both parametric (normal) and bootstrap Monte Carlo for 1-year forward return.
-
+async def _compute_portfolio_stress_test(weights_raw: dict[str, float], simulations: int = 10_000) -> str:
+    """Core portfolio stress test engine taking explicit weights.
     Bootstrap resamples the empirical return distribution — no normality assumption.
     """
-    try:
-        positions = await app.t212.get_portfolio()
-    except Exception as e:
-        return f"Error fetching portfolio: {e}"
-
-    if not positions:
-        return "No open positions."
-
-    tickers = list(dict.fromkeys(strip_t212_ticker(p["ticker"]) for p in positions))
-    weights_raw = {strip_t212_ticker(p["ticker"]): position_value(p) for p in positions}
+    tickers = list(weights_raw.keys())
+    if not tickers:
+        return "No tickers."
     total = sum(weights_raw.values()) or 1
     weights = {k: v / total for k, v in weights_raw.items()}
 
@@ -405,23 +379,11 @@ async def _get_portfolio_stress_test(simulations: int = 10_000) -> str:
 # Portfolio Allocation
 # ---------------------------------------------------------------------------
 
-async def _get_portfolio_allocation() -> str:
-    """Portfolio allocation by sector, geography, market cap, plus concentration metrics.
-
-    Data only — no diversification advice.
-    """
-    try:
-        positions = await app.t212.get_portfolio()
-    except Exception as e:
-        return f"Error: {e}"
-
-    if not positions:
-        return "No open positions."
-
-    holdings = []
-    for p in positions:
-        ticker = strip_t212_ticker(p["ticker"])
-        holdings.append({"ticker": ticker, "value": position_value(p)})
+async def _compute_portfolio_allocation(weights_raw: dict[str, float]) -> str:
+    """Core portfolio allocation engine."""
+    holdings = [{"ticker": t, "value": v} for t, v in weights_raw.items()]
+    if not holdings:
+        return "No positions."
 
     total_val = sum(h["value"] for h in holdings) or 1
 
@@ -495,9 +457,78 @@ async def _get_portfolio_allocation() -> str:
     return "\n".join(lines)
 
 
+async def _get_portfolio_stress_test(simulations: int = 10_000) -> str:
+    """Live T212 portfolio stress test."""
+    try:
+        positions = await app.t212.get_portfolio()
+    except Exception as e:
+        return f"Error fetching portfolio: {e}"
+    if not positions:
+        return "No open positions."
+    weights_raw = {}
+    for p in positions:
+        t = strip_t212_ticker(p["ticker"])
+        weights_raw[t] = weights_raw.get(t, 0) + position_value(p)
+    return await _compute_portfolio_stress_test(weights_raw, simulations=simulations)
+
+async def _get_portfolio_allocation() -> str:
+    """Live T212 portfolio allocation."""
+    try:
+        positions = await app.t212.get_portfolio()
+    except Exception as e:
+        return f"Error: {e}"
+    if not positions:
+        return "No open positions."
+    weights_raw = {}
+    for p in positions:
+        t = strip_t212_ticker(p["ticker"])
+        weights_raw[t] = weights_raw.get(t, 0) + position_value(p)
+    return await _compute_portfolio_allocation(weights_raw)
+
 # ===========================================================================
-# Consolidated analyze_portfolio endpoint
+# Consolidated analyze_portfolio & analyze_scenario endpoints
 # ===========================================================================
+
+@mcp.tool()
+async def analyze_scenario(tickers: str, weights: str, metrics: str = "risk,stress,allocation", initial_value: float = 10000.0, simulations: int = 10_000) -> str:
+    """Run quantitative analysis (Risk, Monte Carlo stress testing) on a custom hypothetical portfolio.
+    
+    tickers: comma-separated symbols (e.g. 'AAPL, MSFT, GOOG')
+    weights: explicit weights per ticker (e.g. '50, 25, 25' or '0.5, 0.25, 0.25'). MUST MATCH TICKERS EXACTLY.
+    metrics: 'risk', 'stress', 'allocation' (comma separated)
+    """
+    syms = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if not syms:
+        return "Error: Provide at least one ticker."
+
+    w_strs = [w.strip().replace('%', '') for w in weights.split(",") if w.strip()]
+    
+    if len(syms) != len(w_strs):
+        return f"Error: Mismatch between tickers count ({len(syms)}) and weights count ({len(w_strs)}). You must provide an explicit weight for every ticker."
+        
+    weights_raw = {}
+    for s, w_str in zip(syms, w_strs):
+        try:
+            val = float(w_str)
+            if val <= 0:
+                return f"Error: Weight for {s} must be > 0 (got {val})"
+            weights_raw[s] = val * initial_value
+        except ValueError:
+            return f"Error: Invalid weight '{w_str}' provided for {s}."
+
+    m_list = [m.strip().lower() for m in metrics.split(",")]
+    lines = [f"**Custom Scenario Analysis: {len(syms)} assets**\n"]
+
+    if "risk" in m_list:
+        lines.append(await _compute_portfolio_risk(weights_raw))
+    if "allocation" in m_list:
+        if lines: lines.append("\n")
+        lines.append(await _compute_portfolio_allocation(weights_raw))
+    if "stress" in m_list:
+        if lines: lines.append("\n")
+        lines.append(await _compute_portfolio_stress_test(weights_raw, simulations=simulations))
+
+    return "\n".join(lines)
 
 @mcp.tool()
 async def analyze_portfolio(metrics: str = "risk,stress,allocation", simulations: int = 10_000) -> str:
