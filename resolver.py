@@ -369,7 +369,13 @@ def resolve(raw: str, *, probe: bool = True) -> ResolvedTicker:
 
 
 async def aresolve(raw: str, *, probe: bool = True) -> ResolvedTicker:
-    return await asyncio.to_thread(resolve, raw, probe=probe)
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(resolve, raw, probe=probe), timeout=15.0)
+    except asyncio.TimeoutError:
+        log.warning("Resolve timed out for %s (probe=%s)", raw, probe)
+        if probe:
+            return await asyncio.to_thread(resolve, raw, probe=False)
+        raise
 
 
 async def bulk_resolve(raws: list[str]) -> dict[str, ResolvedTicker]:
@@ -391,7 +397,15 @@ async def fetch_history(
 ) -> tuple[ResolvedTicker, pd.DataFrame]:
     """Fetch OHLCV history via yfinance, unit-scaled to the resolved currency."""
     rt = await aresolve(raw)
-    df = await asyncio.to_thread(_silent_history, rt.yf_symbol, period, interval)
+    try:
+        df = await asyncio.wait_for(
+            asyncio.to_thread(_silent_history, rt.yf_symbol, period, interval),
+            timeout=15.0
+        )
+    except asyncio.TimeoutError:
+        log.warning("fetch_history timed out for %s", rt.yf_symbol)
+        df = pd.DataFrame()
+
     if df.empty:
         return rt, df
     if rt.unit_scale != 1.0:
@@ -419,7 +433,11 @@ async def fetch_fast_price(
         except Exception:
             return None, None
 
-    last, prev = await asyncio.to_thread(_fetch)
+    try:
+        last, prev = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=10.0)
+    except asyncio.TimeoutError:
+        log.warning("fetch_fast_price timed out for %s", rt.yf_symbol)
+        last, prev = None, None
     if rt.unit_scale != 1.0:
         if last is not None: last *= rt.unit_scale
         if prev is not None: prev *= rt.unit_scale
@@ -488,7 +506,11 @@ async def fetch_historic_prices_scaled(
         except Exception:
             return pd.DataFrame()
 
-    data = await asyncio.to_thread(_download, unique_syms)
+    try:
+        data = await asyncio.wait_for(asyncio.to_thread(_download, unique_syms), timeout=30.0)
+    except asyncio.TimeoutError:
+        log.warning("fetch_historic_prices_scaled timed out for %s", unique_syms)
+        data = pd.DataFrame()
     if data is None or data.empty:
         return resolutions, pd.DataFrame()
 

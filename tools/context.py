@@ -430,11 +430,20 @@ async def get_ticker_context(tickers: str, depth: str = "standard") -> str:
     async def _throttled_get(s):
         async with _YF_META_SEM:
             try:
-                return await _get_single_ticker_context(s, depth)
+                # Individual ticker context should not take > 40s
+                return await asyncio.wait_for(_get_single_ticker_context(s, depth), timeout=40.0)
+            except asyncio.TimeoutError:
+                return f"Error processing {s}: request timed out."
             except Exception as e:
                 return f"Error processing {s}: {e}"
 
-    results = await asyncio.gather(*[_throttled_get(s) for s in target_syms])
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*[_throttled_get(s) for s in target_syms]),
+            timeout=50.0
+        )
+    except asyncio.TimeoutError:
+        return f"The request for {tickers} timed out while processing batch. Try fewer tickers or check connection."
     
     combined = "\n\n" + "="*80 + "\n\n"
     combined = combined.join(results)
