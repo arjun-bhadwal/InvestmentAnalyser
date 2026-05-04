@@ -485,6 +485,20 @@ async def _get_portfolio_allocation() -> str:
         weights_raw[t] = weights_raw.get(t, 0) + position_value(p)
     return await _compute_portfolio_allocation(weights_raw)
 
+async def _get_portfolio_risk() -> str:
+    """Live T212 portfolio risk analytics."""
+    try:
+        positions = await app.t212.get_portfolio()
+    except Exception as e:
+        return f"Error fetching portfolio: {e}"
+    if not positions:
+        return "No open positions to analyse."
+    weights_raw = {}
+    for p in positions:
+        t = strip_t212_ticker(p["ticker"])
+        weights_raw[t] = weights_raw.get(t, 0) + position_value(p)
+    return await _compute_portfolio_risk(weights_raw)
+
 # ===========================================================================
 # Consolidated analyze_portfolio & analyze_scenario endpoints
 # ===========================================================================
