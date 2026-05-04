@@ -51,22 +51,32 @@ async def _get_insider_trades_core(ticker: str) -> str:
 
     for t in transactions[:20]:
         name = (t.get("name") or "Unknown")[:23]
-        tx_type = t.get("transactionType", "")
-        shares = float(t.get("share", 0) or 0)
-        price = float(t.get("transactionPrice", 0) or 0)
+        tx_type = (t.get("transactionType") or "").lower()
+        tx_code = (t.get("transactionCode") or "").upper()
+        
+        # Finnhub 'change' is the transacted amount; 'share' is the ending balance.
+        shares = float(t.get("change") or 0)
+        price = float(t.get("transactionPrice") or 0)
         value = abs(shares * price)
-        date_str = t.get("filingDate", "")[:10]
+        date_str = (t.get("filingDate") or "")[:10]
 
-        if any(kw in tx_type.lower() for kw in ("purchase", "buy", "acquisition")):
+        # Determine side (Buy/Sell)
+        if "purchase" in tx_type or "buy" in tx_type or tx_code == "P":
             side = "BUY"
             total_buy += value
-        elif any(kw in tx_type.lower() for kw in ("sale", "sell", "disposition")):
+        elif "sale" in tx_type or "sell" in tx_type or tx_code == "S":
+            side = "SELL"
+            total_sell += value
+        elif shares > 0:
+            side = "BUY"
+            total_buy += value
+        elif shares < 0:
             side = "SELL"
             total_sell += value
         else:
-            side = tx_type[:7]
+            side = tx_code[:7] if tx_code else "OTHER"
 
-        lines.append(f"{date_str:<14} {name:<24} {side:<8} {shares:>12,.0f} {price:>10,.2f} {value:>14,.0f}")
+        lines.append(f"{date_str:<14} {name:<24} {side:<8} {abs(shares):>12,.0f} {price:>10,.2f} {value:>14,.0f}")
 
     lines.append("-" * 86)
     lines.append(f"Total insider buying:  ${total_buy:>14,.0f}")
