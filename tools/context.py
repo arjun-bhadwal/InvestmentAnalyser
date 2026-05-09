@@ -581,13 +581,15 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
             ]
 
     # ── Fundamentals inline ───────────────────────────────────────────────────
-    def _v(key: str, scale: float = 1, pct: bool = False, billions: bool = False) -> str:
+    def _v(key: str, scale: float = 1, pct: bool = False, billions: bool = False, is_price: bool = False) -> str:
         val = info.get(key)
         if val is None:
             return "N/A"
         v = float(val) / scale
+        if is_price or key == "marketCap":
+            v *= rt.unit_scale
         if billions:
-            return f"${v / 1e9:,.1f}B"
+            return f"{v / 1e9:,.1f}B"
         if pct:
             return f"{v * 100:.1f}%"
         return f"{v:,.2f}"
@@ -620,7 +622,7 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
     )
     lines.append(
         f"- EPS (TTM/Fwd): {ccy} {_v('trailingEps')} / {ccy} {_v('forwardEps')}  |  "
-        f"Mkt Cap: {_v('marketCap', billions=True)}"
+        f"Mkt Cap: {ccy} {_v('marketCap', billions=True)}"
     )
     lines.append(
         f"- Rev growth: {_v('revenueGrowth', pct=True)}  |  "
@@ -628,8 +630,8 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
         f"Beta: {_v('beta')}"
     )
     lines.append(
-        f"- 52w High: {ccy} {_v('fiftyTwoWeekHigh')}  |  "
-        f"52w Low: {ccy} {_v('fiftyTwoWeekLow')}"
+        f"- 52w High: {ccy} {_v('fiftyTwoWeekHigh', is_price=True)}  |  "
+        f"52w Low: {ccy} {_v('fiftyTwoWeekLow', is_price=True)}"
     )
     lines.append("")
 
