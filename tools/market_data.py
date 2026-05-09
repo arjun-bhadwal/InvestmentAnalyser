@@ -84,18 +84,20 @@ async def _get_stock_fundamentals(ticker: str) -> str:
     if not info or (not info.get("marketCap") and not info.get("trailingPE") and not info.get("longName")):
         return f"No fundamental data found for '{ticker}'."
 
-    def _val(key, fmt=",", decimals=2, scale=1, suffix=""):
+    def _val(key, fmt=",", decimals=2, scale=1, suffix="", is_price=False):
         v = info.get(key)
         if v is None:
             return "N/A"
-        v = float(v) / scale
+        val = float(v) / scale
+        if is_price or key == "marketCap":
+            val *= rt.unit_scale
         if fmt == ",":
-            return f"{v:,.{decimals}f}{suffix}"
+            return f"{val:,.{decimals}f}{suffix}"
         if fmt == "B":
-            return f"${v/1e9:,.2f}B"
+            return f"{val/1e9:,.2f}B"
         if fmt == "M":
-            return f"${v/1e6:,.0f}M"
-        return str(v)
+            return f"${val/1e6:,.0f}M"
+        return str(val)
 
     name = info.get("longName") or ticker.upper()
     sector = info.get("sector", "N/A")
@@ -118,7 +120,7 @@ async def _get_stock_fundamentals(ticker: str) -> str:
         f"**{name} ({ticker.upper()}) — Fundamentals**\n\n"
         f"{data_warning}"
         f"**Valuation**\n"
-        f"- Market cap:      {_val('marketCap', 'B')}\n"
+        f"- Market cap:      {currency} {_val('marketCap', 'B')}\n"
         f"- P/E (trailing):  {_val('trailingPE')}\n"
         f"- P/E (forward):   {_val('forwardPE')}\n"
         f"- Price/Book:      {_val('priceToBook')}\n"
@@ -126,15 +128,15 @@ async def _get_stock_fundamentals(ticker: str) -> str:
         f"**Earnings & Revenue**\n"
         f"- EPS (TTM):       {currency} {_val('trailingEps')}\n"
         f"- EPS (forward):   {currency} {_val('forwardEps')}\n"
-        f"- Revenue (TTM):   {_val('totalRevenue', 'B')}\n"
+        f"- Revenue (TTM):   {currency} {_val('totalRevenue', 'B')}\n"
         f"- Revenue growth:  {_val('revenueGrowth', ',', 1, 0.01, '%')}\n"
         f"- Gross margin:    {_val('grossMargins', ',', 1, 0.01, '%')}\n"
         f"- Profit margin:   {_val('profitMargins', ',', 1, 0.01, '%')}\n\n"
         f"**Price & Risk**\n"
-        f"- 52w high:        {currency} {_val('fiftyTwoWeekHigh')}\n"
-        f"- 52w low:         {currency} {_val('fiftyTwoWeekLow')}\n"
-        f"- 50d MA:          {currency} {_val('fiftyDayAverage')}\n"
-        f"- 200d MA:         {currency} {_val('twoHundredDayAverage')}\n"
+        f"- 52w high:        {currency} {_val('fiftyTwoWeekHigh', is_price=True)}\n"
+        f"- 52w low:         {currency} {_val('fiftyTwoWeekLow', is_price=True)}\n"
+        f"- 50d MA:          {currency} {_val('fiftyDayAverage', is_price=True)}\n"
+        f"- 200d MA:         {currency} {_val('twoHundredDayAverage', is_price=True)}\n"
         f"- Beta:            {_val('beta')}\n"
         f"- Dividend yield:  {_div_yield(info)}\n\n"
         f"**Company**\n"
@@ -164,8 +166,10 @@ async def _get_analyst_ratings(ticker: str) -> str:
                 pass
         return info, upgrades
 
+    from resolver import aresolve
     try:
         from helpers import YF_INFO_SEM
+        rt = await aresolve(ticker)
         async with YF_INFO_SEM:
             info, upgrades = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=12.0)
     except Exception as e:
@@ -176,12 +180,17 @@ async def _get_analyst_ratings(ticker: str) -> str:
     lines = [f"**Analyst Ratings — {name} ({ticker.upper()})**\n"]
 
     n = info.get("numberOfAnalystOpinions", "?")
-    mean_t  = info.get("targetMeanPrice")
-    high_t  = info.get("targetHighPrice")
-    low_t   = info.get("targetLowPrice")
-    med_t   = info.get("targetMedianPrice")
     rec_key = info.get("recommendationKey", "N/A").upper()
-    current = info.get("currentPrice") or info.get("regularMarketPrice")
+    # Apply scaling
+    def _s(v):
+        if v is None: return None
+        return float(v) * rt.unit_scale
+
+    current = _s(info.get("currentPrice") or info.get("regularMarketPrice"))
+    mean_t  = _s(info.get("targetMeanPrice"))
+    high_t  = _s(info.get("targetHighPrice"))
+    low_t   = _s(info.get("targetLowPrice"))
+    med_t   = _s(info.get("targetMedianPrice"))
 
     lines.append(f"**Consensus: {rec_key}** ({n} analysts)")
     lines.append("")
