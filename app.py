@@ -22,7 +22,6 @@ T212_API_SECRET = os.environ["T212_API_SECRET"]
 FINNHUB_API_KEY = os.environ["FINNHUB_API_KEY"]
 T212_MODE = os.environ.get("T212_MODE", "demo")
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
-PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY", "")
 POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "")
 
 # ---------------------------------------------------------------------------
@@ -45,7 +44,6 @@ async def lifespan(server):
         "FINNHUB": FINNHUB_API_KEY,
         "FRED": FRED_API_KEY,
         "POLYGON": POLYGON_API_KEY,
-        "PERPLEXITY": PERPLEXITY_API_KEY
     }
     for name, key in keys.items():
         if key:

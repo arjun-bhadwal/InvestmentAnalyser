@@ -149,7 +149,7 @@ def _compute_portfolio_metrics(
 async def get_portfolio_context(horizon: str = "1m") -> str:
     """Full portfolio bundle — one call returns: live positions + P&L, period returns,
     portfolio risk metrics (Sharpe, vol, beta, max-DD), sector/geo/cap allocation,
-    market backdrop, fear/greed, and top-5 headlines.
+    market backdrop, and fear/greed.
 
     Use this as the default starting point for ANY portfolio question.
     Only reach for individual drill-down tools when you need deeper data on a specific holding.
@@ -410,7 +410,7 @@ async def get_portfolio_context(horizon: str = "1m") -> str:
 @mcp.tool()
 async def get_ticker_context(tickers: str, depth: str = "standard") -> str:
     """Full ticker bundle(s) — one call returns: multi-horizon performance (1W/1M/3M/1Y),
-    fundamentals, technical indicators, analyst consensus, and headlines.
+    fundamentals, technical indicators, and analyst consensus.
 
     tickers: comma-separated list of symbols (e.g. 'AAPL, MSFT'). Max 5.
     depth: 'standard' (default) | 'deep' (adds DCF, insider trades, financial statements)
@@ -458,7 +458,6 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
     """Internal helper to fetch detailed context for a single symbol."""
     from resolver import aresolve, fetch_history
     from tools.market_data import _get_stock_fundamentals, _get_analyst_ratings, _get_dcf_valuation, _get_financial_statements
-    from tools.news import _get_news_core
     from tools.insider import _get_insider_trades_core
 
     import ta as ta_lib
@@ -472,7 +471,7 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
     sym = rt.yf_symbol
     display = sym
 
-    # ── Parallel fetches: 1y price history + fundamentals + news ─────────────
+    # ── Parallel fetches: 1y price history + fundamentals + ratings ──────────
     async def _fetch_info():
         from resolver import fetch_fundamental_dict
         try:
@@ -486,8 +485,6 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
         fetch_history(ticker, period="1y", interval="1d"),
         _get_analyst_ratings(sym),
     )
-    company_name = (info.get("longName") or info.get("shortName") or "").strip() or None
-    news_str = await _get_news_core(ticker, max_headlines=5, company_name=company_name)
 
     # ── Deep drill-downs (optional) ──────────────────────────────────────────
     dcf_str = stmts_str = insider_str = None
@@ -664,14 +661,9 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
             lines.append(insider_str)
             lines.append("")
 
-    # News
-    lines.append("### Recent Headlines")
-    for ln in news_str.split("\n"):
-        if ln.strip():
-            lines.append(ln)
-
     lines.append("")
-    lines.append(f"_Data: yFinance (delayed) + Finnhub  |  {now_str}_")
+    lines.append(f"_Data: yFinance (delayed)  |  {now_str}_")
+    lines.append("_Headlines & qualitative context: use web search — not provided by this server._")
 
     return "\n".join(lines)
 
@@ -688,8 +680,8 @@ async def get_opportunity_context(
 ) -> str:
     """Screen a set of tickers for entry setups and annotate results against your current portfolio.
 
-    universe: 'watchlist' (your T212 holdings) | comma-separated tickers discovered via _search_web
-              Use _search_web to find candidates first, then pass them here.
+    universe: 'watchlist' (your T212 holdings) | comma-separated tickers.
+              Discover candidates via web search first, then pass them here.
               Example: "CCJ,UEC,SPUT.TO,DNN.TO" or "SGLN.L,PHAU.L,GLD,IAU,PDBC"
     style:
       'value_dip'     — RSI <40, above MA200, analyst upside >10%  (default)

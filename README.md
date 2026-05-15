@@ -1,6 +1,6 @@
 # Investment Analyser — MCP Server
 
-A remote MCP server that connects to the Trading 212 API and exposes your portfolio, market data, and financial news to Claude. Runs locally on your Mac, exposed via Cloudflare Tunnel.
+A remote MCP server that connects to the Trading 212 API and exposes your portfolio, market data, and a quantitative analysis layer (backtesting, signal evaluation, portfolio optimization) to Claude. It is a deterministic quant + data engine — news and qualitative research are intentionally left to the agent's web search. Runs locally on your Mac, exposed via Cloudflare Tunnel.
 
 ## Tools
 
@@ -9,8 +9,10 @@ A remote MCP server that connects to the Trading 212 API and exposes your portfo
 | `get_portfolio` | Live positions: ticker, qty, avg price, current price, P&L | "Show me my portfolio" |
 | `get_account_summary` | Total value, free cash, invested, unrealised P&L | "What's my account balance?" |
 | `get_price` | Current price + day change for any ticker | "What's the price of TSLA?" |
-| `get_news` | Last 5 headlines for a stock (via Finnhub) | "Any news on Apple?" |
 | `get_market_snapshot` | FTSE 100, S&P 500, NASDAQ moves today | "How are markets doing?" |
+| `backtest_strategy` | Backtest a named strategy template vs buy-and-hold | "Backtest an SMA crossover on AAPL" |
+| `evaluate_signal` | Information coefficient + quantile spread for a signal | "Does momentum predict NVDA returns?" |
+| `optimize_portfolio` | Max-Sharpe / min-variance / risk-parity weights | "Optimize a GLD/AAPL/TLT portfolio" |
 
 ---
 

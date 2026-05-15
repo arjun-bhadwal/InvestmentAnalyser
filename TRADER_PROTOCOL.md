@@ -121,7 +121,7 @@ a data dump. Each desk must state its conclusion before the next desk begins.
 **Sentiment & Flow Desk:**
 - *Primary:* `bigdata_search` for institutional flow commentary. LunarCrush for
   social sentiment on US large-caps (skip for LSE names — thin coverage).
-- *Fallback:* `_get_news_core`, `_search_web`
+- *Fallback:* web search — the MCP server no longer provides news or sentiment.
 - *Verdict:* Is positioning crowded or under-owned? Sentiment tailwind or trap?
 **Macro & News Desk:**
 - *Primary:* `bigdata_market_tearsheet`, `bigdata_country_tearsheet`,
