@@ -354,6 +354,22 @@ async def get_earnings_calendar() -> str:
 
         lines.append(f"{ticker:<10} {next_date:<20} {eps_ttm_str:>12} {eps_fwd_str:>12} {fwd_vs_ttm:>12}")
 
+    # Most-recent EPS surprise per holding (actual vs estimate) — Finnhub, US names
+    import finnhub_data as fd
+    surprise_results = await asyncio.gather(*[fd.earnings_surprises(t, limit=1) for t in tickers])
+    surprise_rows = [(t, s[0]) for t, s in zip(tickers, surprise_results) if s]
+    if surprise_rows:
+        lines.append("")
+        lines.append("**Most Recent EPS Surprise (Finnhub)**")
+        lines.append(f"{'Ticker':<10} {'Period':<12} {'Actual':>10} {'Estimate':>10} {'Surprise':>10}")
+        lines.append("-" * 54)
+        for t, s in surprise_rows:
+            act, est, sp = s.get("actual"), s.get("estimate"), s.get("surprisePercent")
+            a = f"{act:.2f}" if act is not None else "N/A"
+            e = f"{est:.2f}" if est is not None else "N/A"
+            sps = f"{sp:+.1f}%" if sp is not None else "N/A"
+            lines.append(f"{t:<10} {str(s.get('period', ''))[:10]:<12} {a:>10} {e:>10} {sps:>10}")
+
     skipped = [ticker for ticker, _, info in results if info.get("quoteType", "EQUITY") not in ("EQUITY", "")]
     if skipped:
         lines.append(f"\n_Skipped (ETF/ETC/Fund): {', '.join(skipped)}_")

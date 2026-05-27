@@ -488,11 +488,15 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
 
     # ── Deep drill-downs (optional) ──────────────────────────────────────────
     dcf_str = stmts_str = insider_str = None
+    filings = insider_sent = None
     if depth == "deep":
-        dcf_str, stmts_str, insider_str = await asyncio.gather(
+        import finnhub_data as fd
+        dcf_str, stmts_str, insider_str, filings, insider_sent = await asyncio.gather(
             _get_dcf_valuation(sym),
             _get_financial_statements(sym),
             _get_insider_trades_core(ticker),
+            fd.sec_filings(sym),
+            fd.insider_sentiment(sym),
         )
 
     # ── Multi-horizon returns from single 1y frame ────────────────────────────
@@ -659,6 +663,20 @@ async def _get_single_ticker_context(ticker: str, depth: str = "standard") -> st
         if insider_str:
             lines.append("### Insider Activity")
             lines.append(insider_str)
+            lines.append("")
+        if insider_sent:
+            lines.append("### Insider Sentiment (Finnhub MSPR)")
+            lines.append(f"{'Month':<10} {'Net Δ shares':>14} {'MSPR':>10}")
+            for r in insider_sent[-6:]:
+                period = f"{r.get('year','')}-{str(r.get('month','')).zfill(2)}"
+                lines.append(f"{period:<10} {r.get('change', 0):>14,} {r.get('mspr', 0):>10.1f}")
+            lines.append("_MSPR > 0 = net insider buying bias; < 0 = net selling._")
+            lines.append("")
+        if filings:
+            lines.append("### Recent SEC Filings")
+            for f in filings:
+                lines.append(f"- **{f['form']}** ({f['filed']}) — {f['url']}")
+            lines.append("_Fetch a filing URL with web search/fetch for the full text._")
             lines.append("")
 
     lines.append("")
