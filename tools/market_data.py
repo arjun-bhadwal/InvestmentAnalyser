@@ -140,18 +140,13 @@ async def _get_analyst_ratings(ticker: str) -> str:
     Use this to understand what professional analysts think."""
 
     def _fetch():
-        import sys
-        from contextlib import redirect_stdout
         t = yf.Ticker(ticker)
-        with redirect_stdout(sys.stderr):
-            info = t.info
-            # yfinance ≥0.2.x: per-analyst history is in upgrades_downgrades
-            # .recommendations now returns aggregate period counts — not useful here
-            upgrades = None
-            try:
-                upgrades = t.upgrades_downgrades
-            except Exception:
-                pass
+        info = t.info
+        upgrades = None
+        try:
+            upgrades = t.upgrades_downgrades
+        except Exception:
+            pass
         return info, upgrades
 
     from resolver import aresolve
@@ -239,15 +234,12 @@ async def _get_market_snapshot() -> str:
     }
 
     def _fetch():
-        import sys
-        from contextlib import redirect_stdout
-        with redirect_stdout(sys.stderr):
-            return yf.download(
-                list(indices.values()),
-                period="5d",
-                auto_adjust=True,
-                progress=False,
-            )
+        return yf.download(
+            list(indices.values()),
+            period="5d",
+            auto_adjust=True,
+            progress=False,
+        )
 
     try:
         data = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=20.0)
@@ -359,11 +351,8 @@ async def _get_financial_statements(ticker: str) -> str:
         return _format_finnhub_statements(yf_symbol, fh)
 
     def _fetch():
-        import sys
-        from contextlib import redirect_stdout
         t = yf.Ticker(ticker)
-        with redirect_stdout(sys.stderr):
-            return {"info": t.info, "income": t.income_stmt, "balance": t.balance_sheet, "cashflow": t.cashflow}
+        return {"info": t.info, "income": t.income_stmt, "balance": t.balance_sheet, "cashflow": t.cashflow}
 
     try:
         d = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=25.0)
@@ -456,11 +445,8 @@ async def _get_dcf_valuation(ticker: str, growth_rate_pct: float = 0.0, discount
     from helpers import fmt_billions as _b
 
     def _fetch():
-        import sys
-        from contextlib import redirect_stdout
         t = yf.Ticker(ticker)
-        with redirect_stdout(sys.stderr):
-            return t.info, t.cashflow
+        return t.info, t.cashflow
 
     try:
         info, cf = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=20.0)
@@ -568,10 +554,7 @@ async def _compare_peers(tickers: str) -> str:
             info, yf_sym = {}, sym
 
         def _hist():
-            import sys
-            from contextlib import redirect_stdout
-            with redirect_stdout(sys.stderr):
-                return yf.Ticker(yf_sym).history(period="1y", interval="1d", auto_adjust=True)
+            return yf.Ticker(yf_sym).history(period="1y", interval="1d", auto_adjust=True)
         try:
             hist = await asyncio.wait_for(asyncio.to_thread(_hist), timeout=10.0)
         except Exception:
@@ -800,10 +783,9 @@ async def get_price_history(tickers: str, period: str = "5y", interval: str = "1
         try:
             rt = await aresolve(raw)
             def _fetch(sym=rt.yf_symbol, p=period, iv=interval):
-                import sys
-                from contextlib import redirect_stdout
-                with redirect_stdout(sys.stderr):
-                    return yf.Ticker(sym).history(period=p, interval=iv, auto_adjust=True)
+                import logging
+                logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+                return yf.Ticker(sym).history(period=p, interval=iv, auto_adjust=True)
 
             df = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=15.0)
             if df.empty:
