@@ -354,6 +354,22 @@ async def get_earnings_calendar() -> str:
 
         lines.append(f"{ticker:<10} {next_date:<20} {eps_ttm_str:>12} {eps_fwd_str:>12} {fwd_vs_ttm:>12}")
 
+    # Most-recent EPS surprise per holding (actual vs estimate) — Finnhub, US names
+    import finnhub_data as fd
+    surprise_results = await asyncio.gather(*[fd.earnings_surprises(t, limit=1) for t in tickers])
+    surprise_rows = [(t, s[0]) for t, s in zip(tickers, surprise_results) if s]
+    if surprise_rows:
+        lines.append("")
+        lines.append("**Most Recent EPS Surprise (Finnhub)**")
+        lines.append(f"{'Ticker':<10} {'Period':<12} {'Actual':>10} {'Estimate':>10} {'Surprise':>10}")
+        lines.append("-" * 54)
+        for t, s in surprise_rows:
+            act, est, sp = s.get("actual"), s.get("estimate"), s.get("surprisePercent")
+            a = f"{act:.2f}" if act is not None else "N/A"
+            e = f"{est:.2f}" if est is not None else "N/A"
+            sps = f"{sp:+.1f}%" if sp is not None else "N/A"
+            lines.append(f"{t:<10} {str(s.get('period', ''))[:10]:<12} {a:>10} {e:>10} {sps:>10}")
+
     skipped = [ticker for ticker, _, info in results if info.get("quoteType", "EQUITY") not in ("EQUITY", "")]
     if skipped:
         lines.append(f"\n_Skipped (ETF/ETC/Fund): {', '.join(skipped)}_")
@@ -379,7 +395,7 @@ async def _screen_stocks_core(
     """Scan a set of tickers for entry setups using technical and fundamental filters.
 
     universe: "watchlist" (your T212 holdings) | comma-separated tickers
-              Use _search_web to discover candidates first, then pass them here.
+              Discover candidates via web search first, then pass them here.
               Example: "CCJ,UEC,DNN.TO,SPUT.TO" or "SGLN.L,PHAU.L,GLD,IAU"
     max_rsi: only include tickers with RSI below this value
     min_rsi: only include tickers with RSI above this value
@@ -390,6 +406,8 @@ async def _screen_stocks_core(
     min_momentum_1m_pct: minimum 1-month return % — 0 = no filter
     max_results: cap on results"""
 
+    from resolver import fetch_historic_prices_scaled, fetch_fundamental_dict
+
     if universe == "watchlist":
         try:
             positions = await app.t212.get_portfolio()
@@ -399,71 +417,32 @@ async def _screen_stocks_core(
     else:
         tickers = [t.strip().upper() for t in universe.split(",") if t.strip()]
 
+    tickers = list(dict.fromkeys(tickers))  # de-dup, preserve order
     if not tickers:
         return "No tickers to screen."
 
-    async def _batch_parallel(syms):
-        """Download in sub-batches if the main download yields nothing."""
-        # Try full batch first
-        try:
-            def _dl():
-                import sys
-                from contextlib import redirect_stdout
-                with redirect_stdout(sys.stderr):
-                    return yf.download(syms, period="1y", interval="1d", auto_adjust=True, progress=False)
-
-            df = await asyncio.to_thread(_dl)
-            if not df.empty:
-                if isinstance(df.columns, pd.MultiIndex):
-                    return df["Close"]
-                return df[["Close"]].rename(columns={"Close": syms[0]})
-        except Exception:
-            pass
-
-        # If failed, try smaller chunks of 10
-        chunk_size = 10
-        chunks = [syms[i:i + chunk_size] for i in range(0, len(syms), chunk_size)]
-        
-        async def _get_chunk(c):
-            try:
-                def _dl():
-                    import sys
-                    from contextlib import redirect_stdout
-                    with redirect_stdout(sys.stderr):
-                        return yf.download(c, period="1y", interval="1d", auto_adjust=True, progress=False)
-
-                d = await asyncio.to_thread(_dl)
-                if d.empty: return pd.DataFrame()
-                if isinstance(d.columns, pd.MultiIndex):
-                    return d["Close"]
-                return d[["Close"]].rename(columns={"Close": c[0]})
-            except Exception:
-                return pd.DataFrame()
-        
-        results = await asyncio.gather(*[_get_chunk(c) for c in chunks])
-        valid_dfs = [r for r in results if not r.empty]
-        if not valid_dfs:
-            return pd.DataFrame()
-        return pd.concat(valid_dfs, axis=1)
-
+    # ── Resolved, unit-scaled price frame — handles T212 codes, .L, GBX, etc. ──
+    # The resolver de-dups symbols and chunks the download internally, which is
+    # what made the old raw-yf.download path return partial data silently.
     try:
-        closes = await _batch_parallel(tickers)
+        resolutions, closes = await fetch_historic_prices_scaled(tickers, period="1y")
     except Exception as e:
         return f"Error downloading price data: {e}"
-
-    if closes.empty:
+    if closes is None or closes.empty:
         return "Insufficient price data found for this universe."
-    
     closes = closes.dropna(how="all")
-    available = [c for c in closes.columns if closes[c].notna().sum() >= 60]
-    if not available:
-        return "Insufficient price data (too many NaNs in history)."
 
-    candidates = []
-    for sym in available:
-        col = closes[sym].dropna()
+    # ── Technical filter — explicitly track tickers dropped for missing data ──
+    candidates: list[dict] = []
+    dropped: list[str] = []
+    for raw in tickers:
+        rt = resolutions.get(raw)
+        sym = rt.yf_symbol if rt else raw.upper()
+        col = closes[sym].dropna() if sym in closes.columns else pd.Series(dtype=float)
         if len(col) < 60:
+            dropped.append(raw)
             continue
+
         price = safe_float(col.iloc[-1])
         ma50  = safe_float(col.rolling(50).mean().iloc[-1], fallback=None) if len(col) >= 50 else None
         ma200 = safe_float(col.rolling(200).mean().iloc[-1], fallback=None) if len(col) >= 200 else None
@@ -471,13 +450,16 @@ async def _screen_stocks_core(
         delta = col.diff()
         gain  = delta.clip(lower=0).rolling(14).mean()
         loss  = (-delta.clip(upper=0)).rolling(14).mean()
-        
         last_gain = safe_float(gain.iloc[-1])
         last_loss = safe_float(loss.iloc[-1])
         rs    = last_gain / last_loss if last_loss != 0 else 0
         rsi   = 100 - (100 / (1 + rs)) if last_loss != 0 else 100
 
-        mom_1m = (price - safe_float(col.iloc[-22])) / safe_float(col.iloc[-22]) * 100 if len(col) >= 22 and safe_float(col.iloc[-22]) != 0 else None
+        mom_1m = None
+        if len(col) >= 22:
+            base = safe_float(col.iloc[-22])
+            if base not in (0, None):
+                mom_1m = (price - base) / base * 100
 
         if rsi < min_rsi or rsi > max_rsi:
             continue
@@ -488,30 +470,31 @@ async def _screen_stocks_core(
         if min_momentum_1m_pct and (mom_1m is None or mom_1m < min_momentum_1m_pct):
             continue
 
-        candidates.append({"ticker": sym, "price": price, "rsi": rsi, "ma50": ma50, "ma200": ma200, "mom_1m": mom_1m})
+        candidates.append({"ticker": sym, "raw": raw, "price": price,
+                            "rsi": rsi, "ma50": ma50, "ma200": ma200, "mom_1m": mom_1m})
+
+    drop_note = (f"\n\n_⚠️  No usable price history ({len(dropped)}): "
+                 f"{', '.join(dropped)}_") if dropped else ""
 
     if not candidates:
-        return f"No stocks passed technical filters in '{universe}' universe. Try relaxing criteria."
+        return (f"No stocks passed technical filters in '{universe}' universe. "
+                f"Try relaxing criteria.{drop_note}")
 
-    async def _fund(sym):
-        def _f():
-            import sys
-            from contextlib import redirect_stdout
-            t = yf.Ticker(sym)
-            with redirect_stdout(sys.stderr):
-                info = t.info
+    # ── Fundamental enrichment — fetch_fundamental_dict gates concurrency ──────
+    async def _fund(raw: str) -> dict:
+        try:
+            _, info = await fetch_fundamental_dict(raw)
             return {
                 "pe": info.get("trailingPE"), "target": info.get("targetMeanPrice"),
                 "cur_price": info.get("currentPrice") or info.get("regularMarketPrice"),
-                "rec": info.get("recommendationKey", ""), "name": info.get("shortName") or sym,
+                "rec": info.get("recommendationKey", ""),
+                "name": info.get("shortName") or info.get("longName") or raw,
                 "sector": info.get("sector", ""),
             }
-        try:
-            return await asyncio.to_thread(_f)
         except Exception:
             return {}
 
-    fund_results = await asyncio.gather(*[_fund(c["ticker"]) for c in candidates])
+    fund_results = await asyncio.gather(*[_fund(c["raw"]) for c in candidates])
 
     final = []
     for c, f in zip(candidates, fund_results):
@@ -526,14 +509,15 @@ async def _screen_stocks_core(
         final.append({**c, **f, "upside": upside})
 
     if not final:
-        return f"Technical candidates ({len(candidates)}) but none passed fundamental filters."
+        return (f"Technical candidates ({len(candidates)}) but none passed "
+                f"fundamental filters.{drop_note}")
 
     final.sort(key=lambda x: x["rsi"])
     final = final[:max_results]
 
     lines = [
         f"**Stock Screener — {universe.upper()}**\n",
-        f"{'Ticker':<8} {'Name':<24} {'Price':>9} {'RSI':>6} {'1M%':>7} {'Upside%':>9} {'P/E':>7} {'Rec':<10} {'Sector'}",
+        f"{'Ticker':<10} {'Name':<24} {'Price':>9} {'RSI':>6} {'1M%':>7} {'Upside%':>9} {'P/E':>7} {'Rec':<10} {'Sector'}",
         "-" * 100,
     ]
     for s in final:
@@ -541,9 +525,12 @@ async def _screen_stocks_core(
         up_str  = f"+{s['upside']:.1f}%" if s.get("upside") else "N/A"
         mom_str = f"{s['mom_1m']:+.1f}%" if s.get("mom_1m") is not None else "N/A"
         lines.append(
-            f"{s['ticker']:<8} {(s.get('name',''))[:23]:<24} {s['price']:>9,.2f} "
-            f"{s['rsi']:>6.1f} {mom_str:>7} {up_str:>9} {pe_str:>7} {(s.get('rec','') or '').upper()[:9]:<10} {(s.get('sector','') or '')[:18]}"
+            f"{s['ticker']:<10} {(s.get('name',''))[:23]:<24} {s['price']:>9,.2f} "
+            f"{s['rsi']:>6.1f} {mom_str:>7} {up_str:>9} {pe_str:>7} "
+            f"{(s.get('rec','') or '').upper()[:9]:<10} {(s.get('sector','') or '')[:18]}"
         )
 
     lines.append(f"\n{len(final)} candidates — sorted by RSI ascending")
+    if dropped:
+        lines.append(drop_note.strip())
     return "\n".join(lines)

@@ -1,5 +1,4 @@
-"""Market data tools: prices, fundamentals, analyst ratings, market snapshot.
-Includes Polygon.io integration for real-time quotes and market status."""
+"""Market data tools: prices, fundamentals, analyst ratings, market snapshot."""
 import asyncio
 from datetime import datetime
 
@@ -7,21 +6,10 @@ import numpy as np
 import yfinance as yf
 
 import app
+import finnhub_data as fd
 from helpers import cached, cache_fundamentals, cache_prices, fmt_float
 
 mcp = app.mcp
-
-
-# ---------------------------------------------------------------------------
-# Polygon.io helpers
-# ---------------------------------------------------------------------------
-
-def _polygon_client():
-    """Lazy Polygon REST client — returns None if no key configured."""
-    if not app.POLYGON_API_KEY:
-        return None
-    from polygon import RESTClient
-    return RESTClient(api_key=app.POLYGON_API_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -152,18 +140,13 @@ async def _get_analyst_ratings(ticker: str) -> str:
     Use this to understand what professional analysts think."""
 
     def _fetch():
-        import sys
-        from contextlib import redirect_stdout
         t = yf.Ticker(ticker)
-        with redirect_stdout(sys.stderr):
-            info = t.info
-            # yfinance ≥0.2.x: per-analyst history is in upgrades_downgrades
-            # .recommendations now returns aggregate period counts — not useful here
-            upgrades = None
-            try:
-                upgrades = t.upgrades_downgrades
-            except Exception:
-                pass
+        info = t.info
+        upgrades = None
+        try:
+            upgrades = t.upgrades_downgrades
+        except Exception:
+            pass
         return info, upgrades
 
     from resolver import aresolve
@@ -221,6 +204,19 @@ async def _get_analyst_ratings(ticker: str) -> str:
             action   = str(row.get("Action", ""))
             lines.append(f"{date_str:<14} {firm:<28} {to_grade:<22} {action}")
 
+    # Finnhub recommendation-trend history (US names) — clean buy/hold/sell counts
+    rec_trend = await fd.recommendation_trends(rt.yf_symbol)
+    if rec_trend:
+        lines.append("")
+        lines.append("**Recommendation Trend (Finnhub, by month)**")
+        lines.append(f"{'Month':<10} {'StrBuy':>7} {'Buy':>5} {'Hold':>6} {'Sell':>6} {'StrSell':>8}")
+        for r in rec_trend[:6]:
+            lines.append(
+                f"{str(r.get('period', ''))[:7]:<10} {r.get('strongBuy', 0):>7} "
+                f"{r.get('buy', 0):>5} {r.get('hold', 0):>6} {r.get('sell', 0):>6} "
+                f"{r.get('strongSell', 0):>8}"
+            )
+
     return "\n".join(lines)
 
 
@@ -238,15 +234,12 @@ async def _get_market_snapshot() -> str:
     }
 
     def _fetch():
-        import sys
-        from contextlib import redirect_stdout
-        with redirect_stdout(sys.stderr):
-            return yf.download(
-                list(indices.values()),
-                period="5d",
-                auto_adjust=True,
-                progress=False,
-            )
+        return yf.download(
+            list(indices.values()),
+            period="5d",
+            auto_adjust=True,
+            progress=False,
+        )
 
     try:
         data = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=20.0)
@@ -285,19 +278,81 @@ async def _get_market_snapshot() -> str:
 # Financial Statements
 # ---------------------------------------------------------------------------
 
+def _format_finnhub_statements(symbol: str, periods: list[dict]) -> str:
+    """Render as-reported Finnhub statements (US names) in the standard layout."""
+    from helpers import fmt_billions
+
+    cols = periods[:4]
+    yrs = [p["period"][:4] or "?" for p in cols]
+    lines = [f"**{symbol} — Financial Statements (as-reported, via Finnhub/SEC filings)**\n"]
+
+    def _section(title: str, rows: list[tuple[str, str]], block: str):
+        lines.append(f"**{title}**")
+        lines.append(f"{'Metric':<24}" + "".join(f"{y:>14}" for y in yrs))
+        lines.append("-" * (24 + 14 * len(yrs)))
+        for label, key in rows:
+            vals = "".join(f"{fmt_billions(p[block].get(key)):>14}" for p in cols)
+            lines.append(f"{label:<24}{vals}")
+        lines.append("")
+
+    _section("Income Statement (Annual)", [
+        ("Revenue", "revenue"), ("Gross Profit", "gross_profit"),
+        ("Operating Income", "operating_income"), ("Pre-tax Income", "pretax_income"),
+        ("Net Income", "net_income")], "income")
+    _section("Balance Sheet (Annual)", [
+        ("Total Assets", "total_assets"), ("Total Liabilities", "total_liabilities"),
+        ("Shareholders Equity", "equity"), ("Cash & Equivalents", "cash"),
+        ("Long-term Debt", "long_term_debt")], "balance")
+    _section("Cash Flow (Annual)", [
+        ("Operating Cash Flow", "operating_cf"), ("Capex", "capex"),
+        ("Dividends Paid", "dividends_paid"), ("Buybacks", "buybacks")], "cashflow")
+
+    latest = cols[0]
+    inc, bal = latest["income"], latest["balance"]
+    lines.append("**Key Ratios (latest period)**")
+
+    def _ratio(label: str, num, den, pct: bool = True, dp: int = 1) -> str:
+        if num is None or not den:
+            return f"- {label}: N/A"
+        v = num / den * (100 if pct else 1)
+        return f"- {label}: {v:,.{dp}f}{'%' if pct else ''}"
+
+    lines.append(_ratio("ROE", inc.get("net_income"), bal.get("equity")))
+    lines.append(_ratio("ROA", inc.get("net_income"), bal.get("total_assets")))
+    lines.append(_ratio("Gross margin", inc.get("gross_profit"), inc.get("revenue")))
+    lines.append(_ratio("Net margin", inc.get("net_income"), inc.get("revenue")))
+    lines.append(_ratio("Current ratio", bal.get("current_assets"),
+                        bal.get("current_liabilities"), pct=False, dp=2))
+    lines.append(_ratio("Debt/Equity (LT)", bal.get("long_term_debt"),
+                        bal.get("equity"), pct=False, dp=2))
+    lines.append(f"- Free cash flow: {fmt_billions(latest.get('fcf'))}")
+    lines.append(f"\n_As-reported from SEC filings ({cols[0].get('form', '')} basis). Source: Finnhub._")
+    return "\n".join(lines)
+
+
 @cached(cache_fundamentals)
 async def _get_financial_statements(ticker: str) -> str:
     """Return income statement, balance sheet, and cash flow highlights for a stock.
     Shows last 4 annual periods with key ratios: ROE, ROA, current ratio, D/E, FCF yield.
-    Use this for deep fundamental analysis beyond the basics."""
+
+    For US names, uses Finnhub as-reported figures (parsed from SEC filings);
+    falls back to yfinance for non-US names or when Finnhub has no data."""
     from helpers import fmt_billions
+    from resolver import aresolve
+
+    try:
+        rt = await aresolve(ticker)
+        yf_symbol = rt.yf_symbol
+    except Exception:
+        yf_symbol = ticker.upper()
+
+    fh = await fd.reported_financials(yf_symbol)
+    if fh:
+        return _format_finnhub_statements(yf_symbol, fh)
 
     def _fetch():
-        import sys
-        from contextlib import redirect_stdout
         t = yf.Ticker(ticker)
-        with redirect_stdout(sys.stderr):
-            return {"info": t.info, "income": t.income_stmt, "balance": t.balance_sheet, "cashflow": t.cashflow}
+        return {"info": t.info, "income": t.income_stmt, "balance": t.balance_sheet, "cashflow": t.cashflow}
 
     try:
         d = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=25.0)
@@ -390,11 +445,8 @@ async def _get_dcf_valuation(ticker: str, growth_rate_pct: float = 0.0, discount
     from helpers import fmt_billions as _b
 
     def _fetch():
-        import sys
-        from contextlib import redirect_stdout
         t = yf.Ticker(ticker)
-        with redirect_stdout(sys.stderr):
-            return t.info, t.cashflow
+        return t.info, t.cashflow
 
     try:
         info, cf = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=20.0)
@@ -502,10 +554,7 @@ async def _compare_peers(tickers: str) -> str:
             info, yf_sym = {}, sym
 
         def _hist():
-            import sys
-            from contextlib import redirect_stdout
-            with redirect_stdout(sys.stderr):
-                return yf.Ticker(yf_sym).history(period="1y", interval="1d", auto_adjust=True)
+            return yf.Ticker(yf_sym).history(period="1y", interval="1d", auto_adjust=True)
         try:
             hist = await asyncio.wait_for(asyncio.to_thread(_hist), timeout=10.0)
         except Exception:
@@ -551,85 +600,67 @@ async def _compare_peers(tickers: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Polygon.io — Real-time Quote & Market Status
+# Market Status — Finnhub (holiday-aware), timezone heuristic as last resort
 # ---------------------------------------------------------------------------
+
+def _market_status_heuristic() -> str:
+    """Timezone-based open/closed estimate — used only if Finnhub is unreachable."""
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    now_uk = datetime.now(ZoneInfo("Europe/London"))
+    is_weekend = now_et.weekday() >= 5
+    us_open = not is_weekend and (
+        (now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)) and now_et.hour < 16)
+    lse_open = not is_weekend and 8 <= now_uk.hour < 16 and not (
+        now_uk.hour == 16 and now_uk.minute > 30)
+    return "\n".join([
+        f"**Market Status — {now_et.strftime('%d %b %Y %H:%M ET')}**\n",
+        f"- NYSE/NASDAQ: **{'OPEN' if us_open else 'CLOSED'}** (9:30–16:00 ET)",
+        f"- London (LSE): **{'OPEN' if lse_open else 'CLOSED'}** (08:00–16:30 GMT)",
+        "",
+        "_⚠️ Timezone estimate — Finnhub unreachable, holidays not accounted for._",
+    ])
 
 
 @mcp.tool()
 async def get_market_status() -> str:
-    """Return current market status (open/closed) and upcoming holidays via Polygon.io.
-    Falls back to a timezone-based estimate if Polygon is not configured.
+    """Return current market status (open/closed, session) and upcoming US holidays
+    for the NYSE/NASDAQ and London exchanges. Holiday-aware, via Finnhub.
     Use this to know if markets are trading right now."""
 
-    client = _polygon_client()
-    if not client:
-        # Fallback: estimate from time zones
-        from zoneinfo import ZoneInfo
-        now_et = datetime.now(ZoneInfo("America/New_York"))
-        now_uk = datetime.now(ZoneInfo("Europe/London"))
-        weekday = now_et.weekday()  # 0=Mon, 6=Sun
-        is_weekend = weekday >= 5
-        us_open = not is_weekend and 9 <= now_et.hour < 16 and not (now_et.hour == 9 and now_et.minute < 30)
-        lse_open = not is_weekend and 8 <= now_uk.hour < 16 and not (now_uk.hour == 16 and now_uk.minute > 30)
+    # Finnhub market-status is US-only on the free tier; LSE uses a timezone estimate.
+    us, us_hols = await asyncio.gather(fd.market_status("US"), fd.market_holidays("US"))
 
-        lines = [
-            f"**Market Status — {now_et.strftime('%d %b %Y %H:%M ET')}**\n",
-            f"- NYSE/NASDAQ: **{'OPEN' if us_open else 'CLOSED'}** (9:30–16:00 ET)",
-            f"- LSE:         **{'OPEN' if lse_open else 'CLOSED'}** (08:00–16:30 GMT)",
-            f"- Weekend:     {'Yes ⛔' if is_weekend else 'No'}",
-            "",
-            "_⚠️ Estimate only — does not account for holidays. Set POLYGON_API_KEY for precise status._",
-        ]
-        return "\n".join(lines)
+    if not us:
+        return _market_status_heuristic()
 
-    def _fetch():
-        status = client.get_market_status()
-        return status
+    def _us_row(st: dict) -> str:
+        state = "OPEN" if st.get("isOpen") else "CLOSED"
+        session = st.get("session") or ""
+        extra = f" — {session}" if session else ""
+        if st.get("holiday"):
+            extra += f"  (holiday: {st['holiday']})"
+        return f"- US (NYSE/NASDAQ): **{state}**{extra}"
 
-    try:
-        status = await asyncio.to_thread(_fetch)
-    except Exception as e:
-        if "Unknown API Key" in str(e) or "401" in str(e):
-            return f"❌ Polygon API Key Error: Your key is invalid. Please check .env."
-        return f"Error fetching market status: {e}"
+    from zoneinfo import ZoneInfo
+    now_uk = datetime.now(ZoneInfo("Europe/London"))
+    lse_open = now_uk.weekday() < 5 and 8 <= now_uk.hour < 16 and not (
+        now_uk.hour == 16 and now_uk.minute > 30)
 
-    if not status:
-        return "Could not retrieve market status."
-
-    try:
-        lines = [
-            f"**Market Status — {datetime.today().strftime('%d %b %Y %H:%M')}**\n",
-        ]
-
-        # Market status
-        market = getattr(status, 'market', None) or 'unknown'
-        lines.append(f"- Overall market: **{str(market).upper()}**")
-
-        exchanges = getattr(status, 'exchanges', None)
-        if exchanges:
-            lines.append("\n**Exchanges**")
-            for name in ['nyse', 'nasdaq', 'otc']:
-                val = getattr(exchanges, name, None)
-                if val:
-                    lines.append(f"- {name.upper()}: {val}")
-
-        currencies = getattr(status, 'currencies', None)
-        if currencies:
-            fx = getattr(currencies, 'fx', None)
-            crypto = getattr(currencies, 'crypto', None)
-            if fx:
-                lines.append(f"- Forex: {fx}")
-            if crypto:
-                lines.append(f"- Crypto: {crypto}")
-
-        # Server time
-        server_time = getattr(status, 'serverTime', None)
-        if server_time:
-            lines.append(f"\n- Server time: {server_time}")
-
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error parsing market status: {e}"
+    lines = [
+        f"**Market Status — {datetime.now().strftime('%d %b %Y %H:%M')}**\n",
+        _us_row(us),
+        f"- London (LSE): **{'OPEN' if lse_open else 'CLOSED'}** "
+        f"(08:00–16:30 GMT — timezone estimate, holidays not checked)",
+    ]
+    if us_hols:
+        lines.append("\n**Upcoming US holidays**")
+        for h in us_hols:
+            th = h.get("tradingHour") or ""
+            lines.append(f"- {h.get('atDate', '')}: {h.get('eventName', '')}"
+                         f"{f' (partial: {th})' if th else ' (closed)'}")
+    lines.append("\n_Source: Finnhub_")
+    return "\n".join(lines)
 
 
 # ===========================================================================
@@ -703,9 +734,19 @@ async def get_fundamentals(tickers: str, section: str = "overview") -> str:
     tickers: comma-separated list of symbols (e.g. 'AAPL, GOOG').
     section: 'overview' (default), 'ratings', 'statements', 'dcf', 'peers'"""
     
-    # For peer comparison, route back to the legacy comparative engine natively
+    # For peer comparison, route to the comparative engine.
     if section == "peers" or len(tickers.split(",")) > 1:
-        # Route multi-ticker to peer logic
+        syms = [t.strip() for t in tickers.split(",") if t.strip()]
+        # Single ticker + peers → auto-expand the peer set via Finnhub (US names)
+        if section == "peers" and len(syms) == 1:
+            from resolver import aresolve
+            try:
+                rt = await aresolve(syms[0])
+                peers = await fd.company_peers(rt.yf_symbol)
+            except Exception:
+                peers = None
+            if peers:
+                return await _compare_peers(",".join(peers[:6]))
         return await _compare_peers(tickers)
         
     # For single ticker routing:
@@ -742,10 +783,9 @@ async def get_price_history(tickers: str, period: str = "5y", interval: str = "1
         try:
             rt = await aresolve(raw)
             def _fetch(sym=rt.yf_symbol, p=period, iv=interval):
-                import sys
-                from contextlib import redirect_stdout
-                with redirect_stdout(sys.stderr):
-                    return yf.Ticker(sym).history(period=p, interval=iv, auto_adjust=True)
+                import logging
+                logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+                return yf.Ticker(sym).history(period=p, interval=iv, auto_adjust=True)
 
             df = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=15.0)
             if df.empty:

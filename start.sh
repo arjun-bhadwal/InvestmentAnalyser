@@ -24,17 +24,28 @@ echo "  Investment Analyser — Starting Up"
 echo "=================================================="
 echo ""
 
+DOMAIN="gui/$(id -u)"
+LABEL_SERVER="com.investmentanalyser.server"
+LABEL_TUNNEL="com.investmentanalyser.tunnel"
+
+# Bootstrap if not already registered, then kick; if already registered just kick
+restart_service() {
+    local label="$1" plist="$2"
+    if ! launchctl print "$DOMAIN/$label" &>/dev/null; then
+        launchctl bootstrap "$DOMAIN" "$plist"
+    fi
+    launchctl kickstart -kp "$DOMAIN/$label"
+}
+
 # ── 1. Restart MCP server ─────────────────────────────────
 echo "▶  Restarting MCP server..."
-launchctl unload "$PLIST_SERVER" 2>/dev/null || true
-launchctl load   "$PLIST_SERVER"
+restart_service "$LABEL_SERVER" "$PLIST_SERVER"
 
 # ── 2. Restart tunnel (unless --server flag used) ─────────
 if [ "$SERVER_ONLY" = false ]; then
     echo "▶  Restarting Cloudflare tunnel..."
-    launchctl unload "$PLIST_TUNNEL" 2>/dev/null || true
     > "$TUNNEL_LOG"   # clear log so new URL is detected cleanly
-    launchctl load   "$PLIST_TUNNEL"
+    restart_service "$LABEL_TUNNEL" "$PLIST_TUNNEL"
 fi
 
 # ── 3. Wait for server ────────────────────────────────────
